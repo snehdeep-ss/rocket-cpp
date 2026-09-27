@@ -103,13 +103,13 @@ class File {
 
 }  // namespace internal
 
-class ConsoleSink : public Sink {
+class ConsoleSink : public TextSink {
  public:
   enum class Stream { kStdout, kStderr };
 
   explicit ConsoleSink(Stream stream = Stream::kStdout, bool color = true,
                        std::unique_ptr<Formatter> formatter = nullptr)
-      : Sink(std::move(formatter)),
+      : TextSink(std::move(formatter)),
         writer_(stream == Stream::kStdout ? stdout : stderr),
         color_(color) {}
 
@@ -154,11 +154,11 @@ class ConsoleSink : public Sink {
   bool color_;
 };
 
-class FileSink : public Sink {
+class FileSink : public TextSink {
  public:
   explicit FileSink(const std::filesystem::path& path, bool truncate = false,
                     std::unique_ptr<Formatter> formatter = nullptr)
-      : Sink(std::move(formatter)) {
+      : TextSink(std::move(formatter)) {
     file_.Open(path, truncate);
   }
 
@@ -176,12 +176,12 @@ class FileSink : public Sink {
   internal::File file_;
 };
 
-class RotatingFileSink : public Sink {
+class RotatingFileSink : public TextSink {
  public:
   RotatingFileSink(std::filesystem::path path, uintmax_t max_bytes,
                    int max_files,
                    std::unique_ptr<Formatter> formatter = nullptr)
-      : Sink(std::move(formatter)),
+      : TextSink(std::move(formatter)),
         path_(std::move(path)),
         max_bytes_(max_bytes),
         max_files_(max_files) {
@@ -223,13 +223,13 @@ class RotatingFileSink : public Sink {
   internal::File file_;
 };
 
-class CallbackSink : public Sink {
+class CallbackSink : public TextSink {
  public:
   using Callback = std::function<void(const Record&, std::string_view)>;
 
   explicit CallbackSink(Callback callback,
                         std::unique_ptr<Formatter> formatter = nullptr)
-      : Sink(std::move(formatter)), callback_(std::move(callback)) {}
+      : TextSink(std::move(formatter)), callback_(std::move(callback)) {}
 
  protected:
   void Write(const Record& record, std::string_view line) override {
@@ -242,7 +242,7 @@ class CallbackSink : public Sink {
 
 class NullSink : public Sink {
  protected:
-  void Write(const Record&, std::string_view) override {}
+  void Process(const Record&) override {}
 };
 
 }  // namespace rocket

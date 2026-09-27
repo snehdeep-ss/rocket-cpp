@@ -61,6 +61,8 @@ Measured on 8 cores with 2M messages from 8 threads, in ns per message:
 
 Use `kShared` for a single sink or to keep thread count down, and `kPerSink` when several sinks are busy or one of them is slow.
 
+Each sink always sees one thread's records in the order that thread logged them. With `kPerSink`, records from different threads may interleave differently in each sink because every sink has its own queue.
+
 `rocket::ParseLevel("warn")` turns environment variables or config values into a `Level`.
 
 ## Threading model
@@ -81,6 +83,7 @@ Sinks serialise their own I/O, so sync mode and sinks shared between loggers rem
 | `FileSink`         | Appends or truncates a file, creating parent folders.  |
 | `RotatingFileSink` | Rolls to `file.1 … file.N` once `max_bytes` is hit.    |
 | `CallbackSink`     | Hands each record and formatted line to a lambda.      |
+| `BinaryFileSink`   | Compact binary `.blog` file, decoded later.            |
 | `NullSink`         | Discards everything.                                   |
 
 Every sink takes an optional formatter and has its own level:
@@ -90,10 +93,10 @@ auto errors = std::make_shared<rocket::FileSink>("logs/errors.log");
 errors->set_level(rocket::Level::kError);
 ```
 
-Write your own by overriding `Write`, plus `DoCommit` and `DoFlush` if it buffers:
+Write your own text sink by deriving from `TextSink` and overriding `Write`, plus `DoCommit` and `DoFlush` if it buffers:
 
 ```cpp
-class SyslogSink : public rocket::Sink {
+class SyslogSink : public rocket::TextSink {
  protected:
   void Write(const rocket::Record& record, std::string_view line) override;
   void DoCommit() override;
@@ -101,7 +104,35 @@ class SyslogSink : public rocket::Sink {
 };
 ```
 
+To handle raw records without formatting, as `BinaryFileSink` does, derive from `Sink` and override `Process(const Record&)` instead.
+
 The writer calls `Commit` at the end of every batch and `Flush` on `flush_level`, `flush_interval` and `Logger::Flush`. All three are serialised by the base class, so one sink can be shared between loggers. `Record::message` and `line` are views that are valid only for the duration of the call.
+
+## Binary logs
+
+`BinaryFileSink` skips text formatting on the writer thread and stores each record as a level byte, a zig-zag varint nanosecond delta from the previous record, varint thread id and line, and the message bytes. Logger names and source files are written once per file and referenced by id afterwards.
+
+```cpp
+rocket::Logger logger(options, {std::make_shared<rocket::BinaryFileSink>("logs/app.blog")});
+```
+
+Turn it back into a normal log with the bundled decoder, using any `PatternFormatter` pattern:
+
+```bash
+rocket_decode logs/app.blog logs/app.log
+rocket_decode --utc --pattern "{time} {level} {file}:{line} {message}" logs/app.blog
+```
+
+With the same pattern and `Writers::kShared`, the decoded output is byte-for-byte what `FileSink` would have written. Opening an existing file appends a new session, so restarts never corrupt earlier records. A file cut short by a crash decodes up to the last complete record, and `rocket_decode` exits with status 2 to flag it. To read records programmatically, use `rocket::BinaryReader`:
+
+```cpp
+rocket::BinaryReader reader("logs/app.blog");
+rocket::Record record;
+while (reader.Next(record)) Process(record);
+if (reader.status() != rocket::BinaryReader::Status::kOk) Alert();
+```
+
+Compared with a text `FileSink` on the same records, a binary file is about a third smaller and the writer spends about 35% less CPU per record. Messages are still composed as text on the calling thread, so the saving is on the writer side.
 
 ## Formatting
 
@@ -143,7 +174,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ./build/examples/basic
-./build/examples/benchmark
+./build/examples/binary
+./build/tools/rocket_decode logs/orders.blog
 ```
 
 The test suite uses GoogleTest, fetched automatically, and passes under ThreadSanitizer, AddressSanitizer and UndefinedBehaviorSanitizer.

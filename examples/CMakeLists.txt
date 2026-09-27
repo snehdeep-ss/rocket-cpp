@@ -1,4 +1,4 @@
-foreach(example basic benchmark)
+foreach(example basic benchmark binary)
   add_executable(${example} ${example}.cc)
   target_link_libraries(${example} PRIVATE rocket::rocket)
   target_compile_options(

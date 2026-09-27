@@ -1,17 +1,20 @@
 #include "rocket/rocket.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -444,6 +447,174 @@ TEST(RotatingFileSinkTest, RotatesAndCapsBackups) {
   EXPECT_EQ(ReadFile(path.string() + ".1"), "cccc\ndddd\n");
   EXPECT_EQ(ReadFile(path.string() + ".2"), "aaaa\nbbbb\n");
   EXPECT_FALSE(std::filesystem::exists(path.string() + ".3"));
+}
+
+struct DecodedRecord {
+  Level level;
+  uint32_t thread_id;
+  std::string logger;
+  std::string file;
+  int line;
+  std::string message;
+  int64_t nanos;
+
+  bool operator==(const DecodedRecord& other) const {
+    return level == other.level && thread_id == other.thread_id &&
+           logger == other.logger && file == other.file && line == other.line &&
+           message == other.message && nanos == other.nanos;
+  }
+};
+
+DecodedRecord Decode(const Record& record) {
+  return {record.level,
+          record.thread_id,
+          std::string(record.logger_name),
+          record.location.file,
+          record.location.line,
+          std::string(record.message),
+          internal::ToNanoseconds(record.time)};
+}
+
+std::vector<DecodedRecord> ReadAll(
+    const std::filesystem::path& path,
+    BinaryReader::Status expected_status = BinaryReader::Status::kOk) {
+  BinaryReader reader(path);
+  EXPECT_TRUE(reader.is_open());
+  std::vector<DecodedRecord> records;
+  Record record;
+  while (reader.Next(record)) records.push_back(Decode(record));
+  EXPECT_EQ(reader.status(), expected_status);
+  return records;
+}
+
+TEST(BinaryTest, VarintAndZigZagRoundTrip) {
+  for (int64_t value : {int64_t{0}, int64_t{-1}, int64_t{1}, int64_t{-300},
+                        int64_t{1} << 40, std::numeric_limits<int64_t>::min(),
+                        std::numeric_limits<int64_t>::max()}) {
+    EXPECT_EQ(internal::ZigZagDecode(internal::ZigZagEncode(value)), value);
+  }
+  std::string out;
+  internal::PutVarint(out, 300);
+  EXPECT_EQ(out, std::string("\xac\x02"));
+}
+
+TEST(BinaryTest, RoundTripsEveryField) {
+  const std::filesystem::path path = FreshDirectory("binary") / "app.blog";
+  auto sink = std::make_shared<BinaryFileSink>(path, true);
+  ASSERT_TRUE(sink->is_open());
+
+  std::vector<DecodedRecord> expected;
+  auto capture = std::make_shared<CallbackSink>(
+      [&expected](const Record& record, std::string_view) {
+        expected.push_back(Decode(record));
+      });
+  {
+    Options options = MakeOptions();
+    options.name = "api";
+    options.writers = Writers::kShared;
+    Options db_options = MakeOptions(Mode::kSync);
+    db_options.name = "db";
+    Logger api(options, {sink, capture});
+    Logger db(db_options, {sink, capture});
+    for (int i = 0; i < 500; ++i) {
+      ROCKET_WARN(api, "request ", i, " took ", i * 0.5, "ms");
+      if (i % 50 == 0) db.Error("slow query ", i);
+    }
+    api.Info(std::string(10000, 'x'));
+    api.Flush();
+  }
+
+  const std::vector<DecodedRecord> decoded = ReadAll(path);
+  ASSERT_EQ(decoded.size(), expected.size());
+  std::vector<DecodedRecord> sorted_expected = expected;
+  std::vector<DecodedRecord> sorted_decoded = decoded;
+  const auto by_content = [](const DecodedRecord& a, const DecodedRecord& b) {
+    return std::tie(a.logger, a.message, a.nanos) <
+           std::tie(b.logger, b.message, b.nanos);
+  };
+  std::sort(sorted_expected.begin(), sorted_expected.end(), by_content);
+  std::sort(sorted_decoded.begin(), sorted_decoded.end(), by_content);
+  EXPECT_TRUE(sorted_decoded == sorted_expected);
+  for (const DecodedRecord& record : decoded) {
+    if (record.logger == "db" || record.message.size() == 10000) {
+      EXPECT_EQ(record.file, "");
+    } else {
+      EXPECT_EQ(std::filesystem::path(record.file).filename(),
+                "rocket_test.cc");
+      EXPECT_EQ(record.level, Level::kWarn);
+    }
+  }
+}
+
+TEST(BinaryTest, DecodesToTheSameTextAsTheTextSink) {
+  const std::filesystem::path directory = FreshDirectory("binary_text");
+  const std::string pattern =
+      "{time} [{level}] [{thread}] {logger} {file}:{line} {message}";
+  {
+    Options options = MakeOptions();
+    options.writers = Writers::kPerSink;
+    Logger logger(options, {std::make_shared<FileSink>(
+                                directory / "app.log", true,
+                                std::make_unique<PatternFormatter>(
+                                    pattern, PatternFormatter::Clock::kUtc)),
+                            std::make_shared<BinaryFileSink>(
+                                directory / "app.blog", true)});
+    for (int i = 0; i < 1000; ++i) ROCKET_INFO(logger, "event ", i, ' ', true);
+  }
+
+  std::string decoded;
+  const PatternFormatter formatter(pattern, PatternFormatter::Clock::kUtc);
+  BinaryReader reader(directory / "app.blog");
+  Record record;
+  while (reader.Next(record)) {
+    formatter.Format(record, decoded);
+    decoded.push_back('\n');
+  }
+  EXPECT_EQ(reader.status(), BinaryReader::Status::kOk);
+  EXPECT_EQ(decoded, ReadFile(directory / "app.log"));
+}
+
+TEST(BinaryTest, AppendsNewSessions) {
+  const std::filesystem::path path = FreshDirectory("binary_append") / "a.blog";
+  for (const char* name : {"first", "second"}) {
+    Options options = MakeOptions(Mode::kSync);
+    options.name = name;
+    Logger logger(options, {std::make_shared<BinaryFileSink>(path)});
+    logger.Info(name, " run");
+  }
+
+  const std::vector<DecodedRecord> decoded = ReadAll(path);
+  ASSERT_EQ(decoded.size(), 2u);
+  EXPECT_EQ(decoded[0].logger, "first");
+  EXPECT_EQ(decoded[0].message, "first run");
+  EXPECT_EQ(decoded[1].logger, "second");
+  EXPECT_EQ(decoded[1].message, "second run");
+}
+
+TEST(BinaryTest, ReportsTruncationAndKeepsCompleteRecords) {
+  const std::filesystem::path path = FreshDirectory("binary_cut") / "a.blog";
+  {
+    Logger logger(MakeOptions(Mode::kSync),
+                  {std::make_shared<BinaryFileSink>(path, true)});
+    for (int i = 0; i < 10; ++i) logger.Info("record ", i);
+  }
+  std::filesystem::resize_file(path, std::filesystem::file_size(path) - 3);
+
+  const std::vector<DecodedRecord> decoded =
+      ReadAll(path, BinaryReader::Status::kTruncated);
+  ASSERT_EQ(decoded.size(), 9u);
+  EXPECT_EQ(decoded.back().message, "record 8");
+}
+
+TEST(BinaryTest, RejectsCorruptInput) {
+  const std::filesystem::path path = FreshDirectory("binary_bad") / "a.blog";
+  std::filesystem::create_directories(path.parent_path());
+  {
+    std::ofstream stream(path, std::ios::binary);
+    stream << "not a rocket log";
+  }
+  EXPECT_TRUE(ReadAll(path, BinaryReader::Status::kCorrupt).empty());
+  EXPECT_FALSE(BinaryReader(path.parent_path() / "missing.blog").is_open());
 }
 
 }  // namespace

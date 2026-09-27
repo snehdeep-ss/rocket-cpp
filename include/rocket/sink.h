@@ -16,9 +16,7 @@ namespace rocket {
 
 class Sink {
  public:
-  explicit Sink(std::unique_ptr<Formatter> formatter = nullptr)
-      : formatter_(formatter ? std::move(formatter)
-                             : std::make_unique<PatternFormatter>()) {}
+  Sink() = default;
   virtual ~Sink() = default;
 
   Sink(const Sink&) = delete;
@@ -32,10 +30,7 @@ class Sink {
   void Consume(const Record& record) {
     if (record.level < level()) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    line_.clear();
-    formatter_->Format(record, line_);
-    line_.push_back('\n');
-    Write(record, line_);
+    Process(record);
   }
 
   void Commit() {
@@ -49,14 +44,33 @@ class Sink {
   }
 
  protected:
-  virtual void Write(const Record& record, std::string_view line) = 0;
+  virtual void Process(const Record& record) = 0;
   virtual void DoCommit() {}
   virtual void DoFlush() {}
 
  private:
-  std::unique_ptr<Formatter> formatter_;
   std::atomic<Level> level_{Level::kTrace};
   std::mutex mutex_;
+};
+
+class TextSink : public Sink {
+ public:
+  explicit TextSink(std::unique_ptr<Formatter> formatter = nullptr)
+      : formatter_(formatter ? std::move(formatter)
+                             : std::make_unique<PatternFormatter>()) {}
+
+ protected:
+  virtual void Write(const Record& record, std::string_view line) = 0;
+
+ private:
+  void Process(const Record& record) final {
+    line_.clear();
+    formatter_->Format(record, line_);
+    line_.push_back('\n');
+    Write(record, line_);
+  }
+
+  std::unique_ptr<Formatter> formatter_;
   std::string line_;
 };
 

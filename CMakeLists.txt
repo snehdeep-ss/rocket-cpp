@@ -5,6 +5,7 @@ project(rocket-cpp VERSION 1.0.0 LANGUAGES CXX)
 option(ROCKET_BUILD_TESTS "Build rocket-cpp tests" ${PROJECT_IS_TOP_LEVEL})
 option(ROCKET_BUILD_EXAMPLES "Build rocket-cpp examples"
        ${PROJECT_IS_TOP_LEVEL})
+option(ROCKET_BUILD_TOOLS "Build the rocket_decode tool" ${PROJECT_IS_TOP_LEVEL})
 
 find_package(Threads REQUIRED)
 
@@ -24,6 +25,10 @@ install(
   NAMESPACE rocket::
   FILE rocketConfig.cmake
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rocket)
+
+if(ROCKET_BUILD_TOOLS)
+  add_subdirectory(tools)
+endif()
 
 if(ROCKET_BUILD_EXAMPLES)
   add_subdirectory(examples)
