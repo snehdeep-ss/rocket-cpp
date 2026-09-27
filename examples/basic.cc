@@ -15,8 +15,9 @@ int main() {
           rocket::PatternFormatter::Clock::kUtc));
   auto alerts = std::make_shared<rocket::CallbackSink>(
       [](const rocket::Record& record, std::string_view) {
-        std::fprintf(stderr, "alert raised on thread %u: %s\n",
-                     record.thread_id, record.message.c_str());
+        std::fprintf(stderr, "alert raised on thread %u: %.*s\n",
+                     record.thread_id, static_cast<int>(record.message.size()),
+                     record.message.data());
       });
   alerts->set_level(rocket::Level::kError);
 

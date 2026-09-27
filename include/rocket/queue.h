@@ -4,7 +4,6 @@
 #include <atomic>
 #include <cstddef>
 #include <memory>
-#include <utility>
 
 namespace rocket {
 namespace internal {
@@ -27,7 +26,8 @@ class BoundedQueue {
   size_t head() const { return head_.load(std::memory_order_acquire); }
   size_t tail() const { return tail_.load(std::memory_order_acquire); }
 
-  bool TryPush(T&& value) {
+  template <typename Fill>
+  bool TryPush(Fill&& fill) {
     size_t position = tail_.load(std::memory_order_relaxed);
     while (true) {
       Cell& cell = cells_[position & mask_];
@@ -36,7 +36,7 @@ class BoundedQueue {
       if (distance == 0) {
         if (tail_.compare_exchange_weak(position, position + 1,
                                         std::memory_order_relaxed)) {
-          cell.value = std::move(value);
+          fill(cell.value);
           cell.sequence.store(position + 1, std::memory_order_release);
           return true;
         }
@@ -48,7 +48,8 @@ class BoundedQueue {
     }
   }
 
-  bool TryPop(T& value) {
+  template <typename Consume>
+  bool TryPop(Consume&& consume) {
     size_t position = head_.load(std::memory_order_relaxed);
     while (true) {
       Cell& cell = cells_[position & mask_];
@@ -58,7 +59,7 @@ class BoundedQueue {
       if (distance == 0) {
         if (head_.compare_exchange_weak(position, position + 1,
                                         std::memory_order_relaxed)) {
-          value = std::move(cell.value);
+          consume(cell.value);
           cell.sequence.store(position + mask_ + 1, std::memory_order_release);
           return true;
         }
@@ -80,7 +81,7 @@ class BoundedQueue {
  private:
   static constexpr size_t kCacheLine = 64;
 
-  struct Cell {
+  struct alignas(kCacheLine) Cell {
     std::atomic<size_t> sequence{0};
     T value{};
   };

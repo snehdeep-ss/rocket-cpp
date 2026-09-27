@@ -38,6 +38,11 @@ class Sink {
     Write(record, line_);
   }
 
+  void Commit() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    DoCommit();
+  }
+
   void Flush() {
     std::lock_guard<std::mutex> lock(mutex_);
     DoFlush();
@@ -45,6 +50,7 @@ class Sink {
 
  protected:
   virtual void Write(const Record& record, std::string_view line) = 0;
+  virtual void DoCommit() {}
   virtual void DoFlush() {}
 
  private:

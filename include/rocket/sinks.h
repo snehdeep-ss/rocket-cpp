@@ -19,6 +19,42 @@
 namespace rocket {
 namespace internal {
 
+class BufferedWriter {
+ public:
+  static constexpr size_t kCapacity = 64 * 1024;
+
+  explicit BufferedWriter(std::FILE* stream = nullptr) : stream_(stream) {
+    buffer_.reserve(kCapacity);
+  }
+
+  BufferedWriter(const BufferedWriter&) = delete;
+  BufferedWriter& operator=(const BufferedWriter&) = delete;
+
+  std::FILE* stream() const { return stream_; }
+  void set_stream(std::FILE* stream) { stream_ = stream; }
+
+  void Append(std::string_view data) {
+    if (buffer_.size() + data.size() > kCapacity) Drain();
+    buffer_.append(data);
+  }
+
+  void Drain() {
+    if (stream_ != nullptr && !buffer_.empty()) {
+      std::fwrite(buffer_.data(), 1, buffer_.size(), stream_);
+    }
+    buffer_.clear();
+  }
+
+  void Flush() {
+    Drain();
+    if (stream_ != nullptr) std::fflush(stream_);
+  }
+
+ private:
+  std::FILE* stream_;
+  std::string buffer_;
+};
+
 class File {
  public:
   File() = default;
@@ -33,32 +69,35 @@ class File {
     if (path.has_parent_path()) {
       std::filesystem::create_directories(path.parent_path(), error);
     }
-    handle_ = std::fopen(path.string().c_str(), truncate ? "wb" : "ab");
-    if (handle_ == nullptr) return false;
+    writer_.set_stream(
+        std::fopen(path.string().c_str(), truncate ? "wb" : "ab"));
+    if (!is_open()) return false;
     const auto size = std::filesystem::file_size(path, error);
     size_ = error ? 0 : size;
     return true;
   }
 
   void Write(std::string_view data) {
-    if (handle_ == nullptr) return;
-    size_ += std::fwrite(data.data(), 1, data.size(), handle_);
+    if (!is_open()) return;
+    writer_.Append(data);
+    size_ += data.size();
   }
 
-  void Flush() {
-    if (handle_ != nullptr) std::fflush(handle_);
-  }
+  void Commit() { writer_.Drain(); }
+  void Flush() { writer_.Flush(); }
 
   void Close() {
-    if (handle_ != nullptr) std::fclose(handle_);
-    handle_ = nullptr;
+    if (!is_open()) return;
+    writer_.Drain();
+    std::fclose(writer_.stream());
+    writer_.set_stream(nullptr);
   }
 
-  bool is_open() const { return handle_ != nullptr; }
+  bool is_open() const { return writer_.stream() != nullptr; }
   uintmax_t size() const { return size_; }
 
  private:
-  std::FILE* handle_ = nullptr;
+  BufferedWriter writer_;
   uintmax_t size_ = 0;
 };
 
@@ -71,22 +110,24 @@ class ConsoleSink : public Sink {
   explicit ConsoleSink(Stream stream = Stream::kStdout, bool color = true,
                        std::unique_ptr<Formatter> formatter = nullptr)
       : Sink(std::move(formatter)),
-        stream_(stream == Stream::kStdout ? stdout : stderr),
+        writer_(stream == Stream::kStdout ? stdout : stderr),
         color_(color) {}
+
+  ~ConsoleSink() override { writer_.Flush(); }
 
  protected:
   void Write(const Record& record, std::string_view line) override {
     if (!color_) {
-      std::fwrite(line.data(), 1, line.size(), stream_);
+      writer_.Append(line);
       return;
     }
-    colored_.assign(ColorCode(record.level));
-    colored_.append(line.substr(0, line.size() - 1));
-    colored_.append("\x1b[0m\n");
-    std::fwrite(colored_.data(), 1, colored_.size(), stream_);
+    writer_.Append(ColorCode(record.level));
+    writer_.Append(line.substr(0, line.size() - 1));
+    writer_.Append("\x1b[0m\n");
   }
 
-  void DoFlush() override { std::fflush(stream_); }
+  void DoCommit() override { writer_.Drain(); }
+  void DoFlush() override { writer_.Flush(); }
 
  private:
   static std::string_view ColorCode(Level level) {
@@ -109,9 +150,8 @@ class ConsoleSink : public Sink {
     return "";
   }
 
-  std::FILE* stream_;
+  internal::BufferedWriter writer_;
   bool color_;
-  std::string colored_;
 };
 
 class FileSink : public Sink {
@@ -129,6 +169,7 @@ class FileSink : public Sink {
     file_.Write(line);
   }
 
+  void DoCommit() override { file_.Commit(); }
   void DoFlush() override { file_.Flush(); }
 
  private:
@@ -155,6 +196,7 @@ class RotatingFileSink : public Sink {
     file_.Write(line);
   }
 
+  void DoCommit() override { file_.Commit(); }
   void DoFlush() override { file_.Flush(); }
 
  private:

@@ -4,7 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <string>
 #include <string_view>
 
 #include "rocket/level.h"
@@ -22,7 +21,7 @@ struct Record {
   uint32_t thread_id = 0;
   std::string_view logger_name;
   SourceLocation location;
-  std::string message;
+  std::string_view message;
 };
 
 namespace internal {

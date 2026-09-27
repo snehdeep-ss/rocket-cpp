@@ -74,15 +74,18 @@ TEST(BoundedQueueTest, RoundsCapacityAndPreservesOrder) {
   EXPECT_EQ(queue.capacity(), 8u);
   EXPECT_TRUE(queue.Empty());
 
-  for (int i = 0; i < 8; ++i) EXPECT_TRUE(queue.TryPush(int{i}));
-  EXPECT_FALSE(queue.TryPush(8));
+  for (int i = 0; i < 8; ++i) {
+    EXPECT_TRUE(queue.TryPush([i](int& slot) { slot = i; }));
+  }
+  EXPECT_FALSE(queue.TryPush([](int& slot) { slot = 8; }));
 
   int value = -1;
+  const auto take = [&value](int& slot) { value = slot; };
   for (int i = 0; i < 8; ++i) {
-    ASSERT_TRUE(queue.TryPop(value));
+    ASSERT_TRUE(queue.TryPop(take));
     EXPECT_EQ(value, i);
   }
-  EXPECT_FALSE(queue.TryPop(value));
+  EXPECT_FALSE(queue.TryPop(take));
   EXPECT_TRUE(queue.Empty());
 }
 
@@ -98,18 +101,20 @@ TEST(BoundedQueueTest, TransfersEveryItemAcrossThreads) {
   for (int p = 0; p < kProducers; ++p) {
     threads.emplace_back([&queue] {
       for (int i = 1; i <= kPerProducer; ++i) {
-        while (!queue.TryPush(int{i})) std::this_thread::yield();
+        while (!queue.TryPush([i](int& slot) { slot = i; })) {
+          std::this_thread::yield();
+        }
       }
     });
   }
   for (int c = 0; c < kConsumers; ++c) {
     threads.emplace_back([&] {
-      int value = 0;
+      const auto take = [&](int& slot) {
+        sum.fetch_add(slot);
+        consumed.fetch_add(1);
+      };
       while (consumed.load() < kProducers * kPerProducer) {
-        if (queue.TryPop(value)) {
-          sum.fetch_add(value);
-          consumed.fetch_add(1);
-        } else {
+        if (!queue.TryPop(take)) {
           std::this_thread::yield();
         }
       }
@@ -215,7 +220,7 @@ TEST_P(OverflowTest, AppliesPolicyWhenQueueIsFull) {
           entered.set_value();
           released.wait();
         }
-        lines.push_back(record.message);
+        lines.emplace_back(record.message);
       });
 
   Options options = MakeOptions();
@@ -317,6 +322,24 @@ TEST(LoggerTest, FlushWaitsForRecordsFromOtherThreads) {
   logger.Flush();
 
   EXPECT_EQ(collector.lines().size(), 1000u);
+}
+
+TEST(LoggerTest, RecycledSlotsKeepMessagesIntact) {
+  Collector collector;
+  Options options = MakeOptions();
+  options.queue_capacity = 4;
+  std::vector<std::string> expected;
+  {
+    Logger logger(options, {collector.MakeSink()});
+    for (int i = 0; i < 3000; ++i) {
+      const size_t length = i % 3 == 0 ? 3 : i % 3 == 1 ? 100 : 5000;
+      std::string message(length, static_cast<char>('a' + i % 26));
+      message += std::to_string(i);
+      logger.Info(message);
+      expected.push_back(std::move(message));
+    }
+  }
+  EXPECT_EQ(collector.lines(), expected);
 }
 
 TEST(LoggerTest, DestructorDrainsQueue) {

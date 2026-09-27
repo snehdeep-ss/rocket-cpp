@@ -68,6 +68,16 @@ void Append(std::string& out, const T& value) {
   }
 }
 
+struct Entry {
+  Record record;
+  std::string text;
+};
+
+inline std::string& ScratchText() {
+  thread_local std::string text;
+  return text;
+}
+
 }  // namespace internal
 
 class Logger {
@@ -80,7 +90,7 @@ class Logger {
       options_.flush_interval = std::chrono::milliseconds(1);
     }
     if (options_.mode == Mode::kAsync) {
-      queue_ = std::make_unique<internal::BoundedQueue<Record>>(
+      queue_ = std::make_unique<internal::BoundedQueue<internal::Entry>>(
           options_.queue_capacity);
       worker_ = std::thread([this] { Run(); });
     }
@@ -125,8 +135,18 @@ class Logger {
     record.thread_id = internal::CurrentThreadId();
     record.logger_name = options_.name;
     record.location = location;
-    (internal::Append(record.message, args), ...);
-    Submit(std::move(record));
+    if (!worker_.joinable()) {
+      std::string text;
+      (internal::Append(text, args), ...);
+      record.message = text;
+      WriteInline(record);
+      return;
+    }
+    std::string& text = internal::ScratchText();
+    text.clear();
+    (internal::Append(text, args), ...);
+    record.message = text;
+    Enqueue(record);
   }
 
   template <typename... Args>
@@ -174,25 +194,38 @@ class Logger {
 
  private:
   static constexpr size_t kBatchSize = 256;
+  static constexpr size_t kMaxRetainedText = 4096;
+  static constexpr int kBlockedSpins = 16;
+  static constexpr std::chrono::microseconds kBlockedBackoff{50};
   static constexpr int kIdleSpins = 64;
 
-  void Submit(Record record) {
-    if (!worker_.joinable()) {
-      Dispatch(record);
-      if (record.level >= options_.flush_level) FlushSinks();
-      return;
-    }
-    while (!queue_->TryPush(std::move(record))) {
+  void WriteInline(const Record& record) {
+    Dispatch(record);
+    CommitSinks();
+    if (record.level >= options_.flush_level) FlushSinks();
+  }
+
+  void Enqueue(const Record& record) {
+    const auto fill = [&record](internal::Entry& entry) {
+      entry.text.assign(record.message);
+      entry.record = record;
+      entry.record.message = entry.text;
+    };
+    for (int attempt = 0; !queue_->TryPush(fill); ++attempt) {
       switch (options_.overflow_policy) {
         case OverflowPolicy::kBlock:
           WakeWorker();
-          std::this_thread::yield();
+          if (attempt < kBlockedSpins) {
+            std::this_thread::yield();
+          } else {
+            std::this_thread::sleep_for(kBlockedBackoff);
+          }
           break;
         case OverflowPolicy::kDropNewest:
           dropped_.fetch_add(1, std::memory_order_relaxed);
           return;
         case OverflowPolicy::kDropOldest:
-          if (Record evicted; queue_->TryPop(evicted)) {
+          if (queue_->TryPop([](internal::Entry&) {})) {
             dropped_.fetch_add(1, std::memory_order_relaxed);
           }
           break;
@@ -234,24 +267,38 @@ class Logger {
     for (const std::shared_ptr<Sink>& sink : sinks_) sink->Consume(record);
   }
 
+  void CommitSinks() {
+    for (const std::shared_ptr<Sink>& sink : sinks_) sink->Commit();
+  }
+
   void FlushSinks() {
     for (const std::shared_ptr<Sink>& sink : sinks_) sink->Flush();
   }
 
   void Run() {
-    Record record;
+    internal::Entry current;
+    const auto take = [&current](internal::Entry& entry) {
+      std::swap(current, entry);
+    };
     size_t flushed_through = 0;
     bool dirty = false;
     int idle_spins = 0;
     while (true) {
       size_t drained = 0;
       bool urgent = false;
-      while (drained < kBatchSize && queue_->TryPop(record)) {
-        Dispatch(record);
-        urgent = urgent || record.level >= options_.flush_level;
+      while (drained < kBatchSize && queue_->TryPop(take)) {
+        current.record.message = current.text;
+        Dispatch(current.record);
+        urgent = urgent || current.record.level >= options_.flush_level;
+        if (current.text.capacity() > kMaxRetainedText) {
+          std::string().swap(current.text);
+        }
         ++drained;
       }
-      dirty = dirty || drained > 0;
+      if (drained > 0) {
+        CommitSinks();
+        dirty = true;
+      }
 
       const size_t head = queue_->head();
       const size_t requested = flush_requested_.load(std::memory_order_acquire);
@@ -286,7 +333,7 @@ class Logger {
   std::vector<std::shared_ptr<Sink>> sinks_;
   std::atomic<Level> level_;
   std::atomic<uint64_t> dropped_{0};
-  std::unique_ptr<internal::BoundedQueue<Record>> queue_;
+  std::unique_ptr<internal::BoundedQueue<internal::Entry>> queue_;
 
   std::atomic<bool> stopping_{false};
   std::atomic<bool> sleeping_{false};

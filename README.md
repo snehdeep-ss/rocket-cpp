@@ -50,7 +50,11 @@ Arguments are concatenated. Strings, characters, booleans, integers, floats and 
 
 ## Threading model
 
-Logging calls never take a lock. Each record is claimed and published with a single compare-and-swap on the ring buffer, and the worker drains it in batches. When the worker has nothing to do it parks on a condition variable; producers only touch that mutex to wake a parked worker, never while it is running. `kBlock` spins with `yield` instead of sleeping, and `kDropOldest` evicts from the head of the same lock-free queue.
+Logging calls never take a lock. Each record is claimed and published with a single compare-and-swap on the ring buffer, and the worker drains it in batches. When the worker has nothing to do it parks on a condition variable; producers only touch that mutex to wake a parked worker, never while it is running. `kDropOldest` evicts from the head of the same lock-free queue.
+
+The hot path allocates nothing in steady state. Callers compose text in a reused per-thread buffer and copy it into the slot's own string, whose capacity survives across laps. The worker swaps each slot with a spare entry, so the slot is released before any sink runs. Slots are cache-line aligned to avoid false sharing between the worker and producers.
+
+The worker writes each batch through a 64 KB buffer per sink and commits it once per batch rather than once per line. When the queue is full under `kBlock`, callers yield briefly and then back off in 50 µs sleeps, which keeps them from contending with the worker for the very slots it is freeing.
 
 Sinks serialise their own I/O, so sync mode and sinks shared between loggers remain safe.
 
@@ -71,17 +75,18 @@ auto errors = std::make_shared<rocket::FileSink>("logs/errors.log");
 errors->set_level(rocket::Level::kError);
 ```
 
-Write your own by overriding two methods:
+Write your own by overriding `Write`, plus `DoCommit` and `DoFlush` if it buffers:
 
 ```cpp
 class SyslogSink : public rocket::Sink {
  protected:
   void Write(const rocket::Record& record, std::string_view line) override;
+  void DoCommit() override;
   void DoFlush() override;
 };
 ```
 
-`Write` and `DoFlush` are serialised by the base class, so one sink can be shared between loggers.
+The logger calls `Commit` at the end of every batch and `Flush` on `flush_level`, `flush_interval` and `Logger::Flush`. All three are serialised by the base class, so one sink can be shared between loggers. `Record::message` and `line` are views that are valid only for the duration of the call.
 
 ## Formatting
 
