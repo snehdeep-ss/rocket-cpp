@@ -35,6 +35,7 @@ class BoundedQueue {
       const auto distance = static_cast<std::ptrdiff_t>(sequence - position);
       if (distance == 0) {
         if (tail_.compare_exchange_weak(position, position + 1,
+                                        std::memory_order_seq_cst,
                                         std::memory_order_relaxed)) {
           fill(cell.value);
           cell.sequence.store(position + 1, std::memory_order_release);
@@ -69,6 +70,11 @@ class BoundedQueue {
         position = head_.load(std::memory_order_relaxed);
       }
     }
+  }
+
+  bool Idle() const {
+    return tail_.load(std::memory_order_seq_cst) ==
+           head_.load(std::memory_order_seq_cst);
   }
 
   bool Empty() const {

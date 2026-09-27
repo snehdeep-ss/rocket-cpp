@@ -46,13 +46,18 @@ class Logger {
       options_.flush_interval = std::chrono::milliseconds(1);
     }
     if (options_.mode == Mode::kSync || sinks_.empty()) return;
+    std::shared_ptr<internal::TickTimeline> timeline;
+    if (options_.time_source == TimeSource::kCycleCounter) {
+      timeline = std::make_shared<internal::TickTimeline>();
+    }
     if (options_.writers == Writers::kShared) {
-      writers_.push_back(std::make_unique<internal::Writer>(options_, sinks_));
+      writers_.push_back(
+          std::make_unique<internal::Writer>(options_, sinks_, timeline));
       return;
     }
     for (const std::shared_ptr<Sink>& sink : sinks_) {
       writers_.push_back(std::make_unique<internal::Writer>(
-          options_, internal::SinkList{sink}));
+          options_, internal::SinkList{sink}, timeline));
     }
   }
 
@@ -87,20 +92,21 @@ class Logger {
     if (!ShouldLog(level)) return;
     Record record;
     record.level = level;
-    record.time = std::chrono::system_clock::now();
     record.thread_id = internal::CurrentThreadId();
     record.logger_name = options_.name;
     record.location = location;
     if (writers_.empty()) {
+      record.time = std::chrono::system_clock::now();
       std::string text;
       Compose(text, record, args...);
       WriteInline(record);
       return;
     }
+    const uint64_t ticks = Stamp(record);
     std::string& text = internal::ScratchText();
     text.clear();
     Compose(text, record, args...);
-    for (const auto& writer : writers_) writer->Enqueue(record);
+    for (const auto& writer : writers_) writer->Enqueue(record, ticks);
   }
 
   template <typename Site, typename... Args>
@@ -114,20 +120,21 @@ class Logger {
     if (!ShouldLog(kSite.level)) return;
     Record record;
     record.level = kSite.level;
-    record.time = std::chrono::system_clock::now();
     record.thread_id = internal::CurrentThreadId();
     record.logger_name = options_.name;
     record.location = {kSite.file, kSite.line};
     if (writers_.empty()) {
+      record.time = std::chrono::system_clock::now();
       std::string text;
       ComposeFormat(text, record, kSite, args...);
       WriteInline(record);
       return;
     }
+    const uint64_t ticks = Stamp(record);
     std::string& text = internal::ScratchText();
     text.clear();
     ComposeFormat(text, record, kSite, args...);
-    for (const auto& writer : writers_) writer->Enqueue(record);
+    for (const auto& writer : writers_) writer->Enqueue(record, ticks);
   }
 
   template <typename... Args>
@@ -171,6 +178,14 @@ class Logger {
   }
 
  private:
+  uint64_t Stamp(Record& record) const {
+    if (options_.time_source == TimeSource::kCycleCounter) {
+      return internal::ReadTicks();
+    }
+    record.time = std::chrono::system_clock::now();
+    return 0;
+  }
+
   template <typename... Args>
   void Compose(std::string& text, Record& record, const Args&... args) const {
     if (options_.formatting == Formatting::kDeferred) {

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "rocket/args.h"
+#include "rocket/clock.h"
 #include "rocket/options.h"
 #include "rocket/queue.h"
 #include "rocket/record.h"
@@ -46,16 +47,20 @@ inline bool NeedText(const SinkList& sinks) {
 struct Entry {
   Record record;
   std::string text;
+  uint64_t ticks = 0;
 };
 
 class Writer {
  public:
-  Writer(const Options& options, SinkList sinks)
+  Writer(const Options& options, SinkList sinks,
+         std::shared_ptr<TickTimeline> timeline)
       : overflow_policy_(options.overflow_policy),
         flush_level_(options.flush_level),
         flush_interval_(options.flush_interval),
         sinks_(std::move(sinks)),
         needs_text_(NeedText(sinks_)),
+        use_ticks_(timeline != nullptr),
+        clock_(std::move(timeline)),
         queue_(options.queue_capacity),
         thread_([this] { Run(); }) {}
 
@@ -73,8 +78,9 @@ class Writer {
 
   uint64_t dropped() const { return dropped_.load(std::memory_order_relaxed); }
 
-  void Enqueue(const Record& record) {
-    const auto fill = [&record](Entry& entry) {
+  void Enqueue(const Record& record, uint64_t ticks) {
+    const auto fill = [&record, ticks](Entry& entry) {
+      entry.ticks = ticks;
       entry.text.assign(record.payload == Payload::kText ? record.message
                                                          : record.args);
       entry.record = record;
@@ -126,18 +132,16 @@ class Writer {
   static constexpr std::chrono::microseconds kBlockedBackoff{50};
 
   void WakeThread() {
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (!sleeping_.load(std::memory_order_relaxed)) return;
+    if (!sleeping_.load(std::memory_order_seq_cst)) return;
     std::lock_guard<std::mutex> lock(mutex_);
     wake_.notify_one();
   }
 
   bool Park(size_t flushed_through) {
     std::unique_lock<std::mutex> lock(mutex_);
-    sleeping_.store(true, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
+    sleeping_.store(true, std::memory_order_seq_cst);
     bool timed_out = false;
-    if (queue_.Empty() && !stopping_.load(std::memory_order_relaxed) &&
+    if (queue_.Idle() && !stopping_.load(std::memory_order_relaxed) &&
         flush_requested_.load(std::memory_order_relaxed) <= flushed_through) {
       timed_out =
           wake_.wait_for(lock, flush_interval_) == std::cv_status::timeout;
@@ -155,6 +159,7 @@ class Writer {
   }
 
   void Resolve(Entry& entry) {
+    if (use_ticks_) entry.record.time = clock_.ToTime(entry.ticks);
     if (entry.record.payload == Payload::kText) {
       entry.record.message = entry.text;
       entry.record.args = {};
@@ -225,6 +230,8 @@ class Writer {
   const std::chrono::milliseconds flush_interval_;
   const SinkList sinks_;
   const bool needs_text_;
+  const bool use_ticks_;
+  TickConverter clock_;
   std::string rendered_;
   BoundedQueue<Entry> queue_;
   std::atomic<uint64_t> dropped_{0};

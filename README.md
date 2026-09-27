@@ -40,6 +40,7 @@ Arguments are concatenated. Strings, characters, booleans, integers, floats and 
 | `mode`             | `Mode::kAsync`  | `kAsync` uses writer threads, `kSync` writes inline.    |
 | `writers`          | `kShared`       | `kShared`: one writer for all sinks. `kPerSink`: one each. |
 | `formatting`       | `kEager`        | `kEager` formats on the caller, `kDeferred` on the writer. |
+| `time_source`      | `kCycleCounter` | How async callers timestamp records; see below.         |
 | `overflow_policy`  | `kBlock`        | `kBlock`, `kDropNewest` or `kDropOldest` when full.     |
 | `queue_capacity`   | `8192`          | Pending records per writer, rounded to a power of 2.    |
 | `level`            | `Level::kInfo`  | Minimum level accepted. Changeable with `set_level`.    |
@@ -68,13 +69,19 @@ Each sink always sees one thread's records in the order that thread logged them.
 
 ## Threading model
 
-Logging calls never take a lock. Each record is claimed and published with a single compare-and-swap on the ring buffer, and the worker drains it in batches. When the worker has nothing to do it parks on a condition variable; producers only touch that mutex to wake a parked worker, never while it is running. `kDropOldest` evicts from the head of the same lock-free queue.
+Logging calls never take a lock and never issue a memory fence. Each record is claimed with a single compare-and-swap on the ring buffer, and the worker drains it in batches. When the worker has nothing to do it parks on a condition variable. Parking and waking use a Dekker handshake between the worker's `sleeping` flag and the queue's tail counter: the producer's claim is already a sequentially consistent read-modify-write, so checking whether the worker sleeps costs a plain load on x86. Producers only touch the mutex to wake a parked worker, never while it is running. `kDropOldest` evicts from the head of the same lock-free queue.
 
 The hot path allocates nothing in steady state. Callers compose text in a reused per-thread buffer and copy it into the slot's own string, whose capacity survives across laps. The worker swaps each slot with a spare entry, so the slot is released before any sink runs. Slots are cache-line aligned to avoid false sharing between the worker and producers.
 
 The worker writes each batch through a 64 KB buffer per sink and commits it once per batch rather than once per line. When the queue is full under `kBlock`, callers yield briefly and then back off in 50 µs sleeps, which keeps them from contending with the worker for the very slots it is freeing.
 
 Sinks serialise their own I/O, so sync mode and sinks shared between loggers remain safe.
+
+## Timestamps
+
+With `TimeSource::kCycleCounter`, async callers read the CPU's cycle counter (`rdtsc` on x86, `cntvct_el0` on ARM64, `steady_clock` elsewhere), about 6 ns against 18 ns for `system_clock::now()`. Writer threads turn ticks into wall-clock time. The tick range is split into segments of 2^22 ticks; the first writer to need a segment samples the cycle counter and `system_clock` together and records the mapping in a table shared by all of that logger's writers. Every writer therefore converts a given tick to exactly the same time, so sinks agree to the nanosecond, and each segment picks up any adjustment to the system clock. Timestamps land within a microsecond of `system_clock::now()` once a logger has run for a few milliseconds.
+
+This relies on an invariant cycle counter, which every x86-64 CPU of the last decade and every ARM64 CPU provides. Set `TimeSource::kSystemClock` to call `system_clock::now()` on every record instead. Sync mode always uses the system clock.
 
 ## Sinks
 
@@ -138,13 +145,15 @@ Every `ROCKET_*F` macro creates a static `CallSite` holding its level, format st
 
 `BinaryFileSink` writes each call site once per file, on first use, and every later record from it is the site id, a timestamp delta, the thread and logger ids, and the argument values. `rocket_decode` looks the site up and fills in the format string. IDs are assigned per file on first use rather than by a build step, so there is nothing to generate and the library stays header-only.
 
-For `"fill {} px {} qty {} venue {}"` over one million records on one thread:
+For `"fill {} px {} qty {} venue {}"` over one million records on one thread, with the system clock:
 
 | Style                        | File size | Per call | End to end |
 | ---------------------------- | --------- | -------- | ---------- |
 | `ROCKET_INFO`, eager         | 55.2 MB   | 230 ns   | 272 ns     |
 | `ROCKET_INFO`, deferred      | 58.9 MB   | 118 ns   | 150 ns     |
-| `ROCKET_INFOF`, deferred     | 22.7 MB   | 88 ns    | 115 ns     |
+| `ROCKET_INFOF`, deferred     | 22.6 MB   | 75 ns    | 108 ns     |
+
+With the default cycle-counter timestamps the last row drops to 61 ns per call and 104 ns end to end.
 
 That is about 23 bytes per record, against 55 for a concatenated one and 95 for the equivalent text line.
 

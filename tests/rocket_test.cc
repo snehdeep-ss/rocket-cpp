@@ -937,5 +937,81 @@ TEST(FormatTest, RejectsCorruptSites) {
   EXPECT_TRUE(ReadAll(path, BinaryReader::Status::kCorrupt).empty());
 }
 
+class TimeSourceTest : public ::testing::TestWithParam<TimeSource> {};
+
+TEST_P(TimeSourceTest, TimestampsTrackTheSystemClock) {
+  using std::chrono::system_clock;
+  constexpr int kRecords = 60;
+  std::vector<system_clock::time_point> stamped;
+  auto sink = std::make_shared<CallbackSink>(
+      [&stamped](const Record& record, std::string_view) {
+        stamped.push_back(record.time);
+      });
+  Options options = MakeOptions();
+  options.time_source = GetParam();
+  std::vector<std::pair<system_clock::time_point, system_clock::time_point>>
+      windows;
+  {
+    Logger logger(options, {sink});
+    for (int i = 0; i < kRecords; ++i) {
+      const auto before = system_clock::now();
+      ROCKET_INFOF(logger, "tick {}", i);
+      windows.emplace_back(before, system_clock::now());
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
+  ASSERT_EQ(stamped.size(), static_cast<size_t>(kRecords));
+  for (int i = 0; i < kRecords; ++i) {
+    const auto slack =
+        i < 10 ? std::chrono::milliseconds(5) : std::chrono::milliseconds(0);
+    const auto jitter = std::chrono::microseconds(100);
+    EXPECT_GE(stamped[i], windows[i].first - jitter - slack) << i;
+    EXPECT_LE(stamped[i], windows[i].second + jitter + slack) << i;
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Sources, TimeSourceTest,
+    ::testing::Values(TimeSource::kCycleCounter, TimeSource::kSystemClock),
+    [](const ::testing::TestParamInfo<TimeSource>& param_info) {
+      return param_info.param == TimeSource::kCycleCounter ? "CycleCounter"
+                                                           : "SystemClock";
+    });
+
+TEST(WakeTest, ParkedWriterWakesForEveryRecord) {
+  using std::chrono::steady_clock;
+  std::vector<steady_clock::time_point> delivered;
+  std::mutex mutex;
+  auto sink =
+      std::make_shared<CallbackSink>([&](const Record&, std::string_view) {
+        std::lock_guard<std::mutex> lock(mutex);
+        delivered.push_back(steady_clock::now());
+      });
+  Options options = MakeOptions();
+  options.flush_interval = std::chrono::seconds(10);
+  Logger logger(options, {sink});
+
+  steady_clock::duration worst{};
+  for (int i = 0; i < 200; ++i) {
+    std::this_thread::sleep_for(std::chrono::microseconds(500 + i % 7 * 300));
+    const auto logged = steady_clock::now();
+    logger.Info(i);
+    while (true) {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (delivered.size() == static_cast<size_t>(i + 1)) {
+          worst = std::max(worst, delivered.back() - logged);
+          break;
+        }
+      }
+      ASSERT_LT(steady_clock::now() - logged, std::chrono::seconds(5))
+          << "record " << i << " was never delivered";
+      std::this_thread::yield();
+    }
+  }
+  EXPECT_LT(worst, std::chrono::milliseconds(500));
+}
+
 }  // namespace
 }  // namespace rocket

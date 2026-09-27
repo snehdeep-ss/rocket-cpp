@@ -17,11 +17,14 @@ enum class Writers { kShared, kPerSink };
 
 enum class Formatting { kEager, kDeferred };
 
+enum class TimeSource { kCycleCounter, kSystemClock };
+
 struct Options {
   std::string name = "rocket";
   Mode mode = Mode::kAsync;
   Writers writers = Writers::kShared;
   Formatting formatting = Formatting::kEager;
+  TimeSource time_source = TimeSource::kCycleCounter;
   OverflowPolicy overflow_policy = OverflowPolicy::kBlock;
   size_t queue_capacity = 8192;
   Level level = Level::kInfo;

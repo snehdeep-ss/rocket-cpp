@@ -3,6 +3,7 @@
 
 #include "rocket/args.h"
 #include "rocket/binary.h"
+#include "rocket/clock.h"
 #include "rocket/formatter.h"
 #include "rocket/level.h"
 #include "rocket/logger.h"
