@@ -39,10 +39,11 @@ Arguments are concatenated. Strings, characters, booleans, integers, floats and 
 | `name`             | `"rocket"`      | Exposed to formatters as `{logger}`.                    |
 | `mode`             | `Mode::kAsync`  | `kAsync` uses writer threads, `kSync` writes inline.    |
 | `writers`          | `kShared`       | `kShared`: one writer for all sinks. `kPerSink`: one each. |
+| `queues`           | `kShared`       | `kShared`: one queue per writer. `kPerThread`: one per calling thread. |
 | `formatting`       | `kEager`        | `kEager` formats on the caller, `kDeferred` on the writer. |
 | `time_source`      | `kCycleCounter` | How async callers timestamp records; see below.         |
 | `overflow_policy`  | `kBlock`        | `kBlock`, `kDropNewest` or `kDropOldest` when full.     |
-| `queue_capacity`   | `8192`          | Pending records per writer, rounded to a power of 2.    |
+| `queue_capacity`   | `8192`          | Pending records per queue, rounded to a power of 2.     |
 | `level`            | `Level::kInfo`  | Minimum level accepted. Changeable with `set_level`.    |
 | `flush_level`      | `Level::kError` | Records at or above this level flush sinks immediately. |
 | `flush_interval`   | `1000ms`        | Idle interval after which buffered output is flushed.   |
@@ -76,6 +77,23 @@ The hot path allocates nothing in steady state. Callers compose text in a reused
 The worker writes each batch through a 64 KB buffer per sink and commits it once per batch rather than once per line. When the queue is full under `kBlock`, callers yield briefly and then back off in 50 µs sleeps, which keeps them from contending with the worker for the very slots it is freeing.
 
 Sinks serialise their own I/O, so sync mode and sinks shared between loggers remain safe.
+
+## Per-thread queues
+
+With `Queues::kShared` every calling thread claims slots in one ring buffer per writer, so under contention the threads fight over the same cache line. With `Queues::kPerThread` each thread gets its own ring for each writer the first time it logs, found afterwards through a four-slot thread-local cache keyed by a unique writer id. The claim is still a compare-and-swap, but only one core ever touches it, and the fence-free wake-up and `kDropOldest` work unchanged.
+
+The writer merges the queues by timestamp: before each record it stages the front of every queue, repeating until a full pass finds nothing new, and writes the earliest. A record that finished logging before another record was stamped is always written first, and each thread's records keep their exact order. When a thread exits its queue is marked abandoned, drained and freed. `Flush()` snapshots every queue's tail and waits until each has been written past it.
+
+`ROCKET_INFOF`, deferred, binary sink, 2M records, median per call and total throughput:
+
+| Threads | `kShared`           | `kPerThread`        |
+| ------- | ------------------- | ------------------- |
+| 1       | 67 ns, 10.3 M/s     | 67 ns, 10.9 M/s     |
+| 2       | 148 ns, 8.0 M/s     | 71 ns, 9.3 M/s      |
+| 4       | 295 ns, 7.3 M/s     | 93 ns, 8.3 M/s      |
+| 8       | 475 ns, 5.7 M/s     | 96 ns, 7.4 M/s      |
+
+Per-call cost stays flat as threads are added. Beyond two threads the single writer is the bottleneck in both modes, and merging makes it slightly slower per record, so when queues fill under `kBlock` the p99 wait is somewhat longer with `kPerThread`; use `Writers::kPerSink` or a larger `queue_capacity` if that matters. Each queue holds `queue_capacity` records of roughly 200 bytes, so size it per thread: with `kPerThread`, memory grows with the number of logging threads.
 
 ## Timestamps
 

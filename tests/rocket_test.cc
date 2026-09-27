@@ -212,7 +212,7 @@ TEST(LoggerTest, AsyncDeliversFromManyThreads) {
 
 class OverflowTest : public ::testing::TestWithParam<OverflowPolicy> {};
 
-TEST_P(OverflowTest, AppliesPolicyWhenQueueIsFull) {
+void ExpectOverflowPolicy(OverflowPolicy policy, Queues queues) {
   std::promise<void> entered;
   std::promise<void> release;
   std::shared_future<void> released = release.get_future().share();
@@ -230,7 +230,8 @@ TEST_P(OverflowTest, AppliesPolicyWhenQueueIsFull) {
 
   Options options = MakeOptions();
   options.queue_capacity = 4;
-  options.overflow_policy = GetParam();
+  options.overflow_policy = policy;
+  options.queues = queues;
   Logger logger(options, {sink});
 
   logger.Info("start");
@@ -238,12 +239,12 @@ TEST_P(OverflowTest, AppliesPolicyWhenQueueIsFull) {
   std::thread producer([&logger] {
     for (int i = 0; i < 10; ++i) logger.Info(i);
   });
-  if (GetParam() != OverflowPolicy::kBlock) producer.join();
+  if (policy != OverflowPolicy::kBlock) producer.join();
   release.set_value();
-  if (GetParam() == OverflowPolicy::kBlock) producer.join();
+  if (policy == OverflowPolicy::kBlock) producer.join();
   logger.Flush();
 
-  switch (GetParam()) {
+  switch (policy) {
     case OverflowPolicy::kBlock:
       EXPECT_EQ(logger.dropped(), 0u);
       EXPECT_EQ(lines.size(), 11u);
@@ -257,6 +258,11 @@ TEST_P(OverflowTest, AppliesPolicyWhenQueueIsFull) {
       EXPECT_EQ(lines, (std::vector<std::string>{"start", "6", "7", "8", "9"}));
       break;
   }
+}
+
+TEST_P(OverflowTest, AppliesPolicyWhenQueueIsFull) {
+  ExpectOverflowPolicy(GetParam(), Queues::kShared);
+  ExpectOverflowPolicy(GetParam(), Queues::kPerThread);
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -801,12 +807,14 @@ void LogWithFormats(Logger& logger) {
 }
 
 std::vector<std::string> CollectFormats(Mode mode, Formatting formatting,
-                                        Writers writers = Writers::kShared) {
+                                        Writers writers = Writers::kShared,
+                                        Queues queues = Queues::kShared) {
   Collector collector;
   Options options = MakeOptions(mode);
   options.level = Level::kDebug;
   options.formatting = formatting;
   options.writers = writers;
+  options.queues = queues;
   {
     Logger logger(options,
                   {collector.MakeSink("{level} {file}:{line} {message}")});
@@ -834,8 +842,12 @@ TEST(FormatTest, DeferredMatchesEagerInEveryMode) {
       CollectFormats(Mode::kSync, Formatting::kEager);
   for (Mode mode : {Mode::kSync, Mode::kAsync}) {
     for (Writers writers : {Writers::kShared, Writers::kPerSink}) {
-      EXPECT_EQ(CollectFormats(mode, Formatting::kDeferred, writers), expected);
-      EXPECT_EQ(CollectFormats(mode, Formatting::kEager, writers), expected);
+      for (Queues queues : {Queues::kShared, Queues::kPerThread}) {
+        EXPECT_EQ(CollectFormats(mode, Formatting::kDeferred, writers, queues),
+                  expected);
+        EXPECT_EQ(CollectFormats(mode, Formatting::kEager, writers, queues),
+                  expected);
+      }
     }
   }
 }
@@ -1012,6 +1024,126 @@ TEST(WakeTest, ParkedWriterWakesForEveryRecord) {
   }
   EXPECT_LT(worst, std::chrono::milliseconds(500));
 }
+
+class PerThreadTest : public ::testing::TestWithParam<Writers> {};
+
+TEST_P(PerThreadTest, DeliversEveryRecordInPerThreadOrder) {
+  constexpr int kThreads = 8;
+  constexpr int kPerThread = 5000;
+  Collector first;
+  Collector second;
+  Options options = MakeOptions();
+  options.queues = Queues::kPerThread;
+  options.writers = GetParam();
+  options.queue_capacity = 64;
+  Logger logger(options, {first.MakeSink("{thread} {message}"),
+                          second.MakeSink("{thread} {message}")});
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&logger] {
+      for (int i = 0; i < kPerThread; ++i) ROCKET_INFOF(logger, "{}", i);
+    });
+  }
+  for (std::thread& thread : threads) thread.join();
+  logger.Flush();
+
+  for (const Collector* collector : {&first, &second}) {
+    std::map<std::string, int> next;
+    for (const std::string& line : collector->lines()) {
+      const size_t space = line.find(' ');
+      int& expected = next[line.substr(0, space)];
+      EXPECT_EQ(line.substr(space + 1), std::to_string(expected));
+      ++expected;
+    }
+    EXPECT_EQ(next.size(), static_cast<size_t>(kThreads));
+    for (const auto& [thread, count] : next) EXPECT_EQ(count, kPerThread);
+  }
+  EXPECT_EQ(logger.dropped(), 0u);
+}
+
+TEST_P(PerThreadTest, MergesThreadsInTimestampOrder) {
+  constexpr int kThreads = 4;
+  constexpr int kRecords = 2000;
+  for (TimeSource source :
+       {TimeSource::kCycleCounter, TimeSource::kSystemClock}) {
+    Collector collector;
+    Options options = MakeOptions();
+    options.queues = Queues::kPerThread;
+    options.writers = GetParam();
+    options.time_source = source;
+    {
+      Logger logger(options, {collector.MakeSink()});
+      std::atomic<int> turn{0};
+      std::vector<std::thread> threads;
+      for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&logger, &turn, t] {
+          for (int i = t; i < kRecords; i += kThreads) {
+            while (turn.load(std::memory_order_acquire) != i) {
+              std::this_thread::yield();
+            }
+            ROCKET_INFOF(logger, "{}", i);
+            turn.store(i + 1, std::memory_order_release);
+          }
+        });
+      }
+      for (std::thread& thread : threads) thread.join();
+    }
+    const std::vector<std::string> lines = collector.lines();
+    ASSERT_EQ(lines.size(), static_cast<size_t>(kRecords));
+    for (int i = 0; i < kRecords; ++i) ASSERT_EQ(lines[i], std::to_string(i));
+  }
+}
+
+TEST_P(PerThreadTest, DrainsQueuesOfExitedThreads) {
+  Collector collector;
+  Options options = MakeOptions();
+  options.queues = Queues::kPerThread;
+  options.writers = GetParam();
+  options.queue_capacity = 16;
+  Logger logger(options, {collector.MakeSink()});
+  for (int round = 0; round < 20; ++round) {
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 10; ++t) {
+      threads.emplace_back([&logger] {
+        for (int i = 0; i < 10; ++i) logger.Info(i);
+      });
+    }
+    for (std::thread& thread : threads) thread.join();
+  }
+  logger.Flush();
+  EXPECT_EQ(collector.lines().size(), 2000u);
+}
+
+TEST_P(PerThreadTest, OneThreadFeedsMoreLoggersThanTheCacheHolds) {
+  constexpr int kLoggers = 6;
+  std::vector<Collector> collectors(kLoggers);
+  std::vector<std::unique_ptr<Logger>> loggers;
+  Options options = MakeOptions();
+  options.queues = Queues::kPerThread;
+  options.writers = GetParam();
+  for (Collector& collector : collectors) {
+    loggers.push_back(std::make_unique<Logger>(
+        options, internal::SinkList{collector.MakeSink()}));
+  }
+  for (int i = 0; i < 300; ++i) loggers[i % kLoggers]->Info(i);
+  loggers.clear();
+  for (int l = 0; l < kLoggers; ++l) {
+    const std::vector<std::string> lines = collectors[l].lines();
+    ASSERT_EQ(lines.size(), 50u);
+    for (size_t i = 0; i < lines.size(); ++i) {
+      EXPECT_EQ(lines[i], std::to_string(l + static_cast<int>(i) * kLoggers));
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Writers, PerThreadTest,
+    ::testing::Values(Writers::kShared, Writers::kPerSink),
+    [](const ::testing::TestParamInfo<Writers>& param_info) {
+      return param_info.param == Writers::kShared ? "SharedWriter"
+                                                  : "PerSinkWriters";
+    });
 
 }  // namespace
 }  // namespace rocket

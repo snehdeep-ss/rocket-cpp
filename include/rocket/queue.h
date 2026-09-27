@@ -50,7 +50,7 @@ class BoundedQueue {
   }
 
   template <typename Consume>
-  bool TryPop(Consume&& consume) {
+  bool TryPop(Consume&& consume, size_t* popped = nullptr) {
     size_t position = head_.load(std::memory_order_relaxed);
     while (true) {
       Cell& cell = cells_[position & mask_];
@@ -62,6 +62,7 @@ class BoundedQueue {
                                         std::memory_order_relaxed)) {
           consume(cell.value);
           cell.sequence.store(position + mask_ + 1, std::memory_order_release);
+          if (popped != nullptr) *popped = position;
           return true;
         }
       } else if (distance < 0) {

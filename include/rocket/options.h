@@ -15,6 +15,8 @@ enum class OverflowPolicy { kBlock, kDropNewest, kDropOldest };
 
 enum class Writers { kShared, kPerSink };
 
+enum class Queues { kShared, kPerThread };
+
 enum class Formatting { kEager, kDeferred };
 
 enum class TimeSource { kCycleCounter, kSystemClock };
@@ -23,6 +25,7 @@ struct Options {
   std::string name = "rocket";
   Mode mode = Mode::kAsync;
   Writers writers = Writers::kShared;
+  Queues queues = Queues::kShared;
   Formatting formatting = Formatting::kEager;
   TimeSource time_source = TimeSource::kCycleCounter;
   OverflowPolicy overflow_policy = OverflowPolicy::kBlock;

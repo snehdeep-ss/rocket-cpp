@@ -106,7 +106,7 @@ class Logger {
     std::string& text = internal::ScratchText();
     text.clear();
     Compose(text, record, args...);
-    for (const auto& writer : writers_) writer->Enqueue(record, ticks);
+    Enqueue(record, ticks);
   }
 
   template <typename Site, typename... Args>
@@ -134,7 +134,7 @@ class Logger {
     std::string& text = internal::ScratchText();
     text.clear();
     ComposeFormat(text, record, kSite, args...);
-    for (const auto& writer : writers_) writer->Enqueue(record, ticks);
+    Enqueue(record, ticks);
   }
 
   template <typename... Args>
@@ -167,7 +167,7 @@ class Logger {
       internal::FlushAll(sinks_);
       return;
     }
-    std::vector<size_t> targets;
+    std::vector<uint64_t> targets;
     targets.reserve(writers_.size());
     for (const auto& writer : writers_) {
       targets.push_back(writer->RequestFlush());
@@ -178,6 +178,14 @@ class Logger {
   }
 
  private:
+  void Enqueue(const Record& record, uint64_t ticks) {
+    if (options_.queues == Queues::kPerThread) {
+      for (const auto& writer : writers_) writer->EnqueueLocal(record, ticks);
+    } else {
+      for (const auto& writer : writers_) writer->EnqueueShared(record, ticks);
+    }
+  }
+
   uint64_t Stamp(Record& record) const {
     if (options_.time_source == TimeSource::kCycleCounter) {
       return internal::ReadTicks();
