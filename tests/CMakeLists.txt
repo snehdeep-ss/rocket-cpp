@@ -15,3 +15,17 @@ target_compile_options(
 
 include(GoogleTest)
 gtest_discover_tests(rocket_test)
+
+foreach(case placeholder_count runtime_format)
+  add_executable(compile_fail_${case} EXCLUDE_FROM_ALL
+                                      compile_fail/${case}.cc)
+  target_link_libraries(compile_fail_${case} PRIVATE rocket::rocket)
+  add_test(NAME CompileFail.${case}
+           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target
+                   compile_fail_${case})
+endforeach()
+set_tests_properties(
+  CompileFail.placeholder_count
+  PROPERTIES PASS_REGULAR_EXPRESSION
+             "placeholders must match the arguments")
+set_tests_properties(CompileFail.runtime_format PROPERTIES WILL_FAIL TRUE)

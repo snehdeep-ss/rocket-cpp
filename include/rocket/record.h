@@ -15,14 +15,26 @@ struct SourceLocation {
   int line = 0;
 };
 
+struct CallSite {
+  Level level = Level::kInfo;
+  std::string_view format;
+  const char* file = "";
+  int line = 0;
+  std::string_view arg_types;
+};
+
+enum class Payload : uint8_t { kText, kArgs, kSite };
+
 struct Record {
   Level level = Level::kInfo;
   std::chrono::system_clock::time_point time;
   uint32_t thread_id = 0;
   std::string_view logger_name;
   SourceLocation location;
+  Payload payload = Payload::kText;
   std::string_view message;
   std::string_view args;
+  const CallSite* site = nullptr;
 };
 
 namespace internal {

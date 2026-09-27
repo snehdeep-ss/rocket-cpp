@@ -22,6 +22,13 @@ namespace rocket {
 
 namespace internal {
 
+struct SiteInfo {
+  Level level;
+  std::string_view format;
+  const char* file;
+  int line;
+};
+
 inline std::string& ScratchText() {
   thread_local std::string text;
   return text;
@@ -96,6 +103,33 @@ class Logger {
     for (const auto& writer : writers_) writer->Enqueue(record);
   }
 
+  template <typename Site, typename... Args>
+  void LogFormat(Site, const Args&... args) {
+    constexpr internal::SiteInfo kInfo = Site::Get();
+    static_assert(internal::CountPlaceholders(kInfo.format) == sizeof...(Args),
+                  "the number of {} placeholders must match the arguments");
+    static constexpr CallSite kSite{kInfo.level, kInfo.format, kInfo.file,
+                                    kInfo.line,
+                                    internal::Signature<Args...>::kValue};
+    if (!ShouldLog(kSite.level)) return;
+    Record record;
+    record.level = kSite.level;
+    record.time = std::chrono::system_clock::now();
+    record.thread_id = internal::CurrentThreadId();
+    record.logger_name = options_.name;
+    record.location = {kSite.file, kSite.line};
+    if (writers_.empty()) {
+      std::string text;
+      ComposeFormat(text, record, kSite, args...);
+      WriteInline(record);
+      return;
+    }
+    std::string& text = internal::ScratchText();
+    text.clear();
+    ComposeFormat(text, record, kSite, args...);
+    for (const auto& writer : writers_) writer->Enqueue(record);
+  }
+
   template <typename... Args>
   void Trace(const Args&... args) {
     Log(Level::kTrace, {}, args...);
@@ -141,6 +175,7 @@ class Logger {
   void Compose(std::string& text, Record& record, const Args&... args) const {
     if (options_.formatting == Formatting::kDeferred) {
       (internal::Capture(text, args), ...);
+      record.payload = Payload::kArgs;
       record.args = text;
     } else {
       (internal::Append(text, args), ...);
@@ -148,10 +183,24 @@ class Logger {
     }
   }
 
+  template <typename... Args>
+  void ComposeFormat(std::string& text, Record& record, const CallSite& site,
+                     const Args&... args) const {
+    if (options_.formatting == Formatting::kDeferred) {
+      (internal::CaptureValue(text, args), ...);
+      record.payload = Payload::kSite;
+      record.site = &site;
+      record.args = text;
+    } else {
+      internal::FormatEager(text, site.format, args...);
+      record.message = text;
+    }
+  }
+
   void WriteInline(Record& record) {
     std::string rendered;
-    if (!record.args.empty() && internal::NeedText(sinks_)) {
-      internal::RenderArgs(record.args, rendered);
+    if (record.payload != Payload::kText && internal::NeedText(sinks_)) {
+      internal::Render(record, rendered);
       record.message = rendered;
     }
     internal::DispatchAll(sinks_, record);
@@ -165,6 +214,15 @@ class Logger {
   std::vector<std::unique_ptr<internal::Writer>> writers_;
 };
 
+namespace internal {
+
+template <typename Site, typename Format, typename... Args>
+void CallLogFormat(Logger& logger, Site site, const Format&,
+                   const Args&... args) {
+  logger.LogFormat(site, args...);
+}
+
+}  // namespace internal
 }  // namespace rocket
 
 #ifndef ROCKET_MIN_LEVEL
@@ -180,6 +238,38 @@ class Logger {
                          __VA_ARGS__);                                        \
     }                                                                         \
   } while (false)
+
+#define ROCKET_INTERNAL_FIRST(...) ROCKET_INTERNAL_FIRST_IMPL(__VA_ARGS__, 0)
+#define ROCKET_INTERNAL_FIRST_IMPL(first, ...) first
+
+#define ROCKET_LOGF(logger, level, ...)                                 \
+  do {                                                                  \
+    struct RocketSite {                                                 \
+      static constexpr ::rocket::internal::SiteInfo Get() {             \
+        return {level, "" ROCKET_INTERNAL_FIRST(__VA_ARGS__), __FILE__, \
+                __LINE__};                                              \
+      }                                                                 \
+    };                                                                  \
+    ::rocket::Logger& rocket_logger_ = (logger);                        \
+    if ((level) >= ::rocket::Level::ROCKET_MIN_LEVEL &&                 \
+        rocket_logger_.ShouldLog(level)) {                              \
+      ::rocket::internal::CallLogFormat(rocket_logger_, RocketSite{},   \
+                                        __VA_ARGS__);                   \
+    }                                                                   \
+  } while (false)
+
+#define ROCKET_TRACEF(logger, ...) \
+  ROCKET_LOGF(logger, ::rocket::Level::kTrace, __VA_ARGS__)
+#define ROCKET_DEBUGF(logger, ...) \
+  ROCKET_LOGF(logger, ::rocket::Level::kDebug, __VA_ARGS__)
+#define ROCKET_INFOF(logger, ...) \
+  ROCKET_LOGF(logger, ::rocket::Level::kInfo, __VA_ARGS__)
+#define ROCKET_WARNF(logger, ...) \
+  ROCKET_LOGF(logger, ::rocket::Level::kWarn, __VA_ARGS__)
+#define ROCKET_ERRORF(logger, ...) \
+  ROCKET_LOGF(logger, ::rocket::Level::kError, __VA_ARGS__)
+#define ROCKET_FATALF(logger, ...) \
+  ROCKET_LOGF(logger, ::rocket::Level::kFatal, __VA_ARGS__)
 
 #define ROCKET_TRACE(logger, ...) \
   ROCKET_LOG(logger, ::rocket::Level::kTrace, __VA_ARGS__)

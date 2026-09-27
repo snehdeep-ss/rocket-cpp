@@ -22,14 +22,16 @@ namespace rocket {
 namespace internal {
 
 constexpr std::string_view kBinaryMagic = "ROCKETB";
-constexpr uint8_t kBinaryVersion = 2;
+constexpr uint8_t kBinaryVersion = 3;
 constexpr uint64_t kMaxBinaryField = uint64_t{1} << 30;
 
 enum class BinaryTag : uint8_t {
   kSession = 0,
   kString = 1,
   kRecord = 2,
-  kArgsRecord = 3
+  kArgsRecord = 3,
+  kSite = 4,
+  kSiteRecord = 5
 };
 
 inline int64_t ToNanoseconds(std::chrono::system_clock::time_point time) {
@@ -65,21 +67,27 @@ class BinaryFileSink : public Sink {
     if (!file_.is_open()) return;
     buffer_.clear();
     const uint64_t logger = Intern(record.logger_name);
-    const uint64_t file = Intern(record.location.file);
     const int64_t nanos = internal::ToNanoseconds(record.time);
-    const bool deferred = !record.args.empty();
-    const std::string_view payload = deferred ? record.args : record.message;
-    buffer_.push_back(static_cast<char>(deferred
-                                            ? internal::BinaryTag::kArgsRecord
-                                            : internal::BinaryTag::kRecord));
-    buffer_.push_back(static_cast<char>(record.level));
-    internal::PutVarint(buffer_, internal::ZigZagEncode(nanos - last_nanos_));
-    internal::PutVarint(buffer_, record.thread_id);
-    internal::PutVarint(buffer_, logger);
-    internal::PutVarint(buffer_, file);
-    internal::PutVarint(buffer_, static_cast<uint32_t>(record.location.line));
-    internal::PutVarint(buffer_, payload.size());
-    buffer_.append(payload);
+    if (record.payload == Payload::kSite) {
+      const uint64_t site = InternSite(*record.site);
+      buffer_.push_back(static_cast<char>(internal::BinaryTag::kSiteRecord));
+      internal::PutVarint(buffer_, site);
+      PutHeader(nanos, record.thread_id, logger);
+      buffer_.append(record.args);
+    } else {
+      const uint64_t file = Intern(record.location.file);
+      const bool text = record.payload == Payload::kText;
+      const std::string_view payload = text ? record.message : record.args;
+      buffer_.push_back(
+          static_cast<char>(text ? internal::BinaryTag::kRecord
+                                 : internal::BinaryTag::kArgsRecord));
+      buffer_.push_back(static_cast<char>(record.level));
+      PutHeader(nanos, record.thread_id, logger);
+      internal::PutVarint(buffer_, file);
+      internal::PutVarint(buffer_, static_cast<uint32_t>(record.location.line));
+      internal::PutVarint(buffer_, payload.size());
+      buffer_.append(payload);
+    }
     file_.Write(buffer_);
     last_nanos_ = nanos;
   }
@@ -88,6 +96,30 @@ class BinaryFileSink : public Sink {
   void DoFlush() override { file_.Flush(); }
 
  private:
+  void PutHeader(int64_t nanos, uint32_t thread_id, uint64_t logger) {
+    internal::PutVarint(buffer_, internal::ZigZagEncode(nanos - last_nanos_));
+    internal::PutVarint(buffer_, thread_id);
+    internal::PutVarint(buffer_, logger);
+  }
+
+  uint64_t InternSite(const CallSite& site) {
+    const auto found = sites_.find(&site);
+    if (found != sites_.end()) return found->second;
+    const uint64_t file = Intern(site.file);
+    const uint64_t format = Intern(site.format);
+    const uint64_t id = sites_.size();
+    sites_.emplace(&site, id);
+    buffer_.push_back(static_cast<char>(internal::BinaryTag::kSite));
+    internal::PutVarint(buffer_, id);
+    buffer_.push_back(static_cast<char>(site.level));
+    internal::PutVarint(buffer_, file);
+    internal::PutVarint(buffer_, static_cast<uint32_t>(site.line));
+    internal::PutVarint(buffer_, format);
+    internal::PutVarint(buffer_, site.arg_types.size());
+    buffer_.append(site.arg_types);
+    return id;
+  }
+
   uint64_t Intern(std::string_view value) {
     const auto found = ids_.find(value);
     if (found != ids_.end()) return found->second;
@@ -105,6 +137,7 @@ class BinaryFileSink : public Sink {
   std::string buffer_;
   std::deque<std::string> strings_;
   std::unordered_map<std::string_view, uint64_t> ids_;
+  std::unordered_map<const CallSite*, uint64_t> sites_;
   int64_t last_nanos_ = 0;
 };
 
@@ -140,6 +173,11 @@ class BinaryReader {
           return ReadRecord(record, false);
         case internal::BinaryTag::kArgsRecord:
           return ReadRecord(record, true);
+        case internal::BinaryTag::kSite:
+          if (!ReadSite()) return false;
+          break;
+        case internal::BinaryTag::kSiteRecord:
+          return ReadSiteRecord(record);
         default:
           return Fail(Status::kCorrupt);
       }
@@ -203,6 +241,7 @@ class BinaryReader {
       return Fail(Status::kCorrupt);
     }
     strings_.clear();
+    sites_.clear();
     last_nanos_ = 0;
     in_session_ = true;
     return true;
@@ -218,6 +257,120 @@ class BinaryReader {
     }
     std::string& value = strings_.emplace_back();
     return ReadBytes(value, length) || Fail(Status::kTruncated);
+  }
+
+  struct SiteEntry {
+    CallSite site;
+    std::string arg_types;
+  };
+
+  bool ReadSite() {
+    uint64_t id = 0;
+    uint8_t level = 0;
+    uint64_t file = 0;
+    uint64_t line = 0;
+    uint64_t format = 0;
+    uint64_t count = 0;
+    if (!ReadVarint(id)) return false;
+    if (!ReadByte(level)) return Fail(Status::kTruncated);
+    if (!ReadVarint(file) || !ReadVarint(line) || !ReadVarint(format) ||
+        !ReadVarint(count)) {
+      return false;
+    }
+    if (!in_session_ || id != sites_.size() ||
+        level >= static_cast<uint8_t>(Level::kOff) || file >= strings_.size() ||
+        format >= strings_.size() || count > internal::kMaxBinaryField) {
+      return Fail(Status::kCorrupt);
+    }
+    SiteEntry& entry = sites_.emplace_back();
+    if (!ReadBytes(entry.arg_types, count)) return Fail(Status::kTruncated);
+    for (const char tag : entry.arg_types) {
+      if (!internal::IsValidTag(tag)) return Fail(Status::kCorrupt);
+    }
+    entry.site = {static_cast<Level>(level), strings_[format],
+                  strings_[file].c_str(), static_cast<int>(line),
+                  entry.arg_types};
+    return true;
+  }
+
+  bool ReadRawVarint(std::string& out) {
+    for (int i = 0; i < 10; ++i) {
+      uint8_t byte = 0;
+      if (!ReadByte(byte)) return Fail(Status::kTruncated);
+      out.push_back(static_cast<char>(byte));
+      if ((byte & 0x80) == 0) return true;
+    }
+    return Fail(Status::kCorrupt);
+  }
+
+  bool ReadRawFixed(std::string& out, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+      uint8_t byte = 0;
+      if (!ReadByte(byte)) return Fail(Status::kTruncated);
+      out.push_back(static_cast<char>(byte));
+    }
+    return true;
+  }
+
+  bool ReadRawValue(internal::ArgTag tag, std::string& out) {
+    switch (tag) {
+      case internal::ArgTag::kString: {
+        uint64_t length = 0;
+        if (!ReadVarint(length)) return false;
+        if (length > internal::kMaxBinaryField) return Fail(Status::kCorrupt);
+        internal::PutVarint(out, length);
+        if (!ReadBytes(scratch_, length)) return Fail(Status::kTruncated);
+        out.append(scratch_);
+        return true;
+      }
+      case internal::ArgTag::kChar:
+      case internal::ArgTag::kBool:
+        return ReadRawFixed(out, 1);
+      case internal::ArgTag::kSigned:
+      case internal::ArgTag::kUnsigned:
+        return ReadRawVarint(out);
+      case internal::ArgTag::kFloat:
+        return ReadRawFixed(out, 4);
+      case internal::ArgTag::kDouble:
+        return ReadRawFixed(out, 8);
+    }
+    return Fail(Status::kCorrupt);
+  }
+
+  bool ReadSiteRecord(Record& record) {
+    uint64_t id = 0;
+    uint64_t delta = 0;
+    uint64_t thread = 0;
+    uint64_t logger = 0;
+    if (!ReadVarint(id) || !ReadVarint(delta) || !ReadVarint(thread) ||
+        !ReadVarint(logger)) {
+      return false;
+    }
+    if (!in_session_ || id >= sites_.size() || logger >= strings_.size()) {
+      return Fail(Status::kCorrupt);
+    }
+    const CallSite& site = sites_[id].site;
+    args_.clear();
+    for (const char tag : site.arg_types) {
+      if (!ReadRawValue(static_cast<internal::ArgTag>(tag), args_)) {
+        return false;
+      }
+    }
+    message_.clear();
+    if (!internal::RenderFormat(site.format, site.arg_types, args_, message_)) {
+      return Fail(Status::kCorrupt);
+    }
+    last_nanos_ += internal::ZigZagDecode(delta);
+    record.level = site.level;
+    record.time = internal::FromNanoseconds(last_nanos_);
+    record.thread_id = static_cast<uint32_t>(thread);
+    record.logger_name = strings_[logger];
+    record.location = {site.file, site.line};
+    record.payload = Payload::kSite;
+    record.message = message_;
+    record.args = args_;
+    record.site = &site;
+    return true;
   }
 
   bool ReadRecord(Record& record, bool deferred) {
@@ -252,8 +405,10 @@ class BinaryReader {
     record.thread_id = static_cast<uint32_t>(thread);
     record.logger_name = strings_[logger];
     record.location = {strings_[file].c_str(), static_cast<int>(line)};
+    record.payload = deferred ? Payload::kArgs : Payload::kText;
     record.message = message_;
     record.args = deferred ? std::string_view(args_) : std::string_view();
+    record.site = nullptr;
     return true;
   }
 
@@ -264,8 +419,10 @@ class BinaryReader {
   Status status_ = Status::kOk;
   bool in_session_ = false;
   std::deque<std::string> strings_;
+  std::deque<SiteEntry> sites_;
   std::string message_;
   std::string args_;
+  std::string scratch_;
   int64_t last_nanos_ = 0;
 };
 

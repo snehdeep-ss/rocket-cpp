@@ -130,7 +130,23 @@ Measured per call on one thread, logging `"fill ", i, " px ", price, " qty ", qt
 | `BinaryFileSink`  | 222 ns            | 130 ns               | 255 ns              | 165 ns                 |
 | `FileSink` (text) | 225 ns            | 126 ns               | 263 ns              | 340 ns                 |
 
-Deferred formatting moves work off the calling thread; it does not remove it. Paired with `BinaryFileSink` it is faster everywhere. Paired with a text sink, calls get cheaper but the writer does more, so total throughput drops once the writer is saturated. Captured arguments are about the same size as their text, so deferred binary files are not smaller.
+Deferred formatting moves work off the calling thread; it does not remove it. Paired with `BinaryFileSink` it is faster everywhere. Paired with a text sink, calls get cheaper but the writer does more, so total throughput drops once the writer is saturated. With the concatenating macros, captured arguments are about the same size as their text, so deferred binary files are not smaller; the `ROCKET_*F` macros fix that by moving the literal text into the call site.
+
+## Call-site IDs
+
+Every `ROCKET_*F` macro creates a static `CallSite` holding its level, format string, file, line and the compile-time types of its arguments. Under `Formatting::kDeferred` a record is just a pointer to that call site plus the raw argument values, with no literal text and no per-argument type tags.
+
+`BinaryFileSink` writes each call site once per file, on first use, and every later record from it is the site id, a timestamp delta, the thread and logger ids, and the argument values. `rocket_decode` looks the site up and fills in the format string. IDs are assigned per file on first use rather than by a build step, so there is nothing to generate and the library stays header-only.
+
+For `"fill {} px {} qty {} venue {}"` over one million records on one thread:
+
+| Style                        | File size | Per call | End to end |
+| ---------------------------- | --------- | -------- | ---------- |
+| `ROCKET_INFO`, eager         | 55.2 MB   | 230 ns   | 272 ns     |
+| `ROCKET_INFO`, deferred      | 58.9 MB   | 118 ns   | 150 ns     |
+| `ROCKET_INFOF`, deferred     | 22.7 MB   | 88 ns    | 115 ns     |
+
+That is about 23 bytes per record, against 55 for a concatenated one and 95 for the equivalent text line.
 
 ## Binary logs
 
@@ -156,7 +172,7 @@ while (reader.Next(record)) Process(record);
 if (reader.status() != rocket::BinaryReader::Status::kOk) Alert();
 ```
 
-Compared with a text `FileSink` on the same records, a binary file is about a third smaller and the writer spends about 35% less CPU per record. Messages are still composed as text on the calling thread, so the saving is on the writer side.
+Compared with a text `FileSink` on the same records, an eager binary file is about a third smaller and the writer spends about 35% less CPU per record. For the smallest files and cheapest calls, combine it with `Formatting::kDeferred` and the `ROCKET_*F` macros described under call-site IDs.
 
 ## Formatting
 
@@ -172,7 +188,14 @@ For JSON or any other layout, derive from `rocket::Formatter` and implement `For
 
 ## Macros
 
-`ROCKET_TRACE`, `ROCKET_DEBUG`, `ROCKET_INFO`, `ROCKET_WARN`, `ROCKET_ERROR` and `ROCKET_FATAL` capture `{file}` and `{line}` and skip argument evaluation when the level is disabled. Remove low levels from a release build entirely with:
+`ROCKET_TRACE`, `ROCKET_DEBUG`, `ROCKET_INFO`, `ROCKET_WARN`, `ROCKET_ERROR` and `ROCKET_FATAL` concatenate their arguments. `ROCKET_TRACEF` through `ROCKET_FATALF` take a format string with `{}` placeholders:
+
+```cpp
+ROCKET_INFO(logger, "fill ", id, " px ", price);
+ROCKET_INFOF(logger, "fill {} px {}", id, price);
+```
+
+Both capture `{file}` and `{line}` and skip argument evaluation when the level is disabled. Format strings must be string literals and the number of `{}` must match the arguments; either mistake is a compile error. Any other braces are printed as written. Remove low levels from a release build entirely with:
 
 ```
 -DROCKET_MIN_LEVEL=kInfo

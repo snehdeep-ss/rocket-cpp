@@ -263,8 +263,8 @@ INSTANTIATE_TEST_SUITE_P(
     Policies, OverflowTest,
     ::testing::Values(OverflowPolicy::kBlock, OverflowPolicy::kDropNewest,
                       OverflowPolicy::kDropOldest),
-    [](const ::testing::TestParamInfo<OverflowPolicy>& info) {
-      switch (info.param) {
+    [](const ::testing::TestParamInfo<OverflowPolicy>& param_info) {
+      switch (param_info.param) {
         case OverflowPolicy::kBlock:
           return "Block";
         case OverflowPolicy::kDropNewest:
@@ -778,6 +778,163 @@ TEST(DeferredTest, ReadsVersionOneFiles) {
   const std::vector<DecodedRecord> decoded = ReadAll(path);
   ASSERT_EQ(decoded.size(), 1u);
   EXPECT_EQ(decoded[0].message, "from v1");
+}
+
+static_assert(internal::CountPlaceholders("") == 0);
+static_assert(internal::CountPlaceholders("{}") == 1);
+static_assert(internal::CountPlaceholders("a {} b {}{} c") == 3);
+static_assert(internal::CountPlaceholders("{x} { } {") == 0);
+static_assert(internal::Signature<int, double, const char*, Point>::kValue ==
+              std::string_view("\x03\x06\x00\x00", 4));
+
+void LogWithFormats(Logger& logger) {
+  for (int i = 0; i < 200; ++i) {
+    ROCKET_WARNF(logger, "fill {} px {} side {} ok={} at {}", i,
+                 100.25 + i * 0.01, i % 2 == 0 ? 'B' : 'S', true, Point{i, -i});
+    ROCKET_INFOF(logger, "{}{}", static_cast<unsigned char>(i), "tail");
+  }
+  ROCKET_ERRORF(logger, "no args, literal braces {x} { } {");
+  ROCKET_DEBUGF(logger, "big {} f {} e {} s {}",
+                std::numeric_limits<int64_t>::min(), 0.1f, Color::kRed,
+                std::string(5000, 'q'));
+  ROCKET_TRACEF(logger, "filtered out {}", 1);
+}
+
+std::vector<std::string> CollectFormats(Mode mode, Formatting formatting,
+                                        Writers writers = Writers::kShared) {
+  Collector collector;
+  Options options = MakeOptions(mode);
+  options.level = Level::kDebug;
+  options.formatting = formatting;
+  options.writers = writers;
+  {
+    Logger logger(options,
+                  {collector.MakeSink("{level} {file}:{line} {message}")});
+    LogWithFormats(logger);
+  }
+  return collector.lines();
+}
+
+TEST(FormatTest, EagerRendersFormatStrings) {
+  const std::vector<std::string> lines =
+      CollectFormats(Mode::kSync, Formatting::kEager);
+  ASSERT_EQ(lines.size(), 402u);
+  EXPECT_EQ(lines[0].substr(lines[0].find(' ', 5) + 1),
+            "fill 0 px 100.25 side B ok=true at (0, 0)");
+  EXPECT_EQ(lines[1].substr(lines[1].find(' ', 5) + 1), "0tail");
+  EXPECT_EQ(lines[400].substr(lines[400].find(' ', 6) + 1),
+            "no args, literal braces {x} { } {");
+  EXPECT_EQ(lines[401].substr(lines[401].find(' ', 6) + 1),
+            "big -9223372036854775808 f 0.1 e 3 s " + std::string(5000, 'q'));
+  EXPECT_EQ(lines[0].substr(0, lines[0].find(':')), "WARN rocket_test.cc");
+}
+
+TEST(FormatTest, DeferredMatchesEagerInEveryMode) {
+  const std::vector<std::string> expected =
+      CollectFormats(Mode::kSync, Formatting::kEager);
+  for (Mode mode : {Mode::kSync, Mode::kAsync}) {
+    for (Writers writers : {Writers::kShared, Writers::kPerSink}) {
+      EXPECT_EQ(CollectFormats(mode, Formatting::kDeferred, writers), expected);
+      EXPECT_EQ(CollectFormats(mode, Formatting::kEager, writers), expected);
+    }
+  }
+}
+
+TEST(FormatTest, CallSitesAreStaticAndDistinct) {
+  std::vector<const CallSite*> sites;
+  auto capture = std::make_shared<CallbackSink>(
+      [&sites](const Record& record, std::string_view) {
+        sites.push_back(record.site);
+      });
+  Options options = MakeOptions(Mode::kSync);
+  options.formatting = Formatting::kDeferred;
+  Logger logger(options, {capture});
+  for (int i = 0; i < 3; ++i) ROCKET_INFOF(logger, "same {}", i);
+  ROCKET_INFOF(logger, "same {}", 9);
+
+  ASSERT_EQ(sites.size(), 4u);
+  EXPECT_EQ(sites[0], sites[1]);
+  EXPECT_EQ(sites[1], sites[2]);
+  EXPECT_NE(sites[2], sites[3]);
+  EXPECT_EQ(sites[0]->format, "same {}");
+  EXPECT_EQ(sites[0]->level, Level::kInfo);
+  EXPECT_EQ(sites[0]->arg_types, std::string_view("\x03", 1));
+  EXPECT_EQ(sites[3]->line, sites[0]->line + 1);
+}
+
+TEST(FormatTest, BinaryStoresSiteIdsAndDecodesToText) {
+  const std::filesystem::path directory = FreshDirectory("site_binary");
+  const std::string pattern =
+      "{time} [{level}] [{thread}] {logger} {file}:{line} {message}";
+  {
+    Options options = MakeOptions();
+    options.level = Level::kDebug;
+    options.formatting = Formatting::kDeferred;
+    Logger logger(options, {std::make_shared<FileSink>(
+                                directory / "app.log", true,
+                                std::make_unique<PatternFormatter>(
+                                    pattern, PatternFormatter::Clock::kUtc)),
+                            std::make_shared<BinaryFileSink>(
+                                directory / "app.blog", true)});
+    LogWithFormats(logger);
+    logger.Info("concatenated ", 1);
+  }
+
+  std::string decoded;
+  size_t site_records = 0;
+  const PatternFormatter formatter(pattern, PatternFormatter::Clock::kUtc);
+  BinaryReader reader(directory / "app.blog");
+  Record record;
+  while (reader.Next(record)) {
+    site_records += record.payload == Payload::kSite ? 1 : 0;
+    formatter.Format(record, decoded);
+    decoded.push_back('\n');
+  }
+  EXPECT_EQ(reader.status(), BinaryReader::Status::kOk);
+  EXPECT_EQ(site_records, 402u);
+  EXPECT_EQ(decoded, ReadFile(directory / "app.log"));
+}
+
+TEST(FormatTest, SiteRecordsAreSmallerThanConcatenatedRecords) {
+  const std::filesystem::path directory = FreshDirectory("site_size");
+  for (const char* name : {"concat", "format"}) {
+    Options options = MakeOptions(Mode::kSync);
+    options.formatting = Formatting::kDeferred;
+    Logger logger(options,
+                  {std::make_shared<BinaryFileSink>(
+                      directory / (std::string(name) + ".blog"), true)});
+    for (int i = 0; i < 1000; ++i) {
+      if (std::string_view(name) == "concat") {
+        ROCKET_INFO(logger, "fill ", i, " px ", 101.25 + i * 0.0001, " qty ",
+                    i * 100);
+      } else {
+        ROCKET_INFOF(logger, "fill {} px {} qty {}", i, 101.25 + i * 0.0001,
+                     i * 100);
+      }
+    }
+  }
+  const auto concat = std::filesystem::file_size(directory / "concat.blog");
+  const auto format = std::filesystem::file_size(directory / "format.blog");
+  EXPECT_LT(format * 2, concat);
+}
+
+TEST(FormatTest, RejectsCorruptSites) {
+  const std::filesystem::path path = FreshDirectory("site_bad") / "a.blog";
+  std::filesystem::create_directories(path.parent_path());
+  std::string bytes;
+  bytes.push_back(0);
+  bytes.append(internal::kBinaryMagic);
+  bytes.push_back(3);
+  bytes.append(
+      std::string("\x01\x00\x01"
+                  "f",
+                  4));
+  bytes.append(std::string("\x04\x00\x02\x00\x07\x00\x01\x09", 8));
+  {
+    std::ofstream stream(path, std::ios::binary);
+    stream << bytes;
+  }
+  EXPECT_TRUE(ReadAll(path, BinaryReader::Status::kCorrupt).empty());
 }
 
 }  // namespace

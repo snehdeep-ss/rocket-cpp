@@ -46,7 +46,6 @@ inline bool NeedText(const SinkList& sinks) {
 struct Entry {
   Record record;
   std::string text;
-  bool deferred = false;
 };
 
 class Writer {
@@ -76,8 +75,8 @@ class Writer {
 
   void Enqueue(const Record& record) {
     const auto fill = [&record](Entry& entry) {
-      entry.deferred = !record.args.empty();
-      entry.text.assign(entry.deferred ? record.args : record.message);
+      entry.text.assign(record.payload == Payload::kText ? record.message
+                                                         : record.args);
       entry.record = record;
     };
     for (int attempt = 0; !queue_.TryPush(fill); ++attempt) {
@@ -156,7 +155,7 @@ class Writer {
   }
 
   void Resolve(Entry& entry) {
-    if (!entry.deferred) {
+    if (entry.record.payload == Payload::kText) {
       entry.record.message = entry.text;
       entry.record.args = {};
       return;
@@ -165,7 +164,7 @@ class Writer {
     entry.record.message = {};
     if (!needs_text_) return;
     rendered_.clear();
-    RenderArgs(entry.text, rendered_);
+    Render(entry.record, rendered_);
     entry.record.message = rendered_;
   }
 
