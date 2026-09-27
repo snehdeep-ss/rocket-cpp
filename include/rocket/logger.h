@@ -2,19 +2,16 @@
 #define ROCKET_LOGGER_H_
 
 #include <atomic>
-#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 #include <vector>
-#include <version>
 
+#include "rocket/args.h"
 #include "rocket/level.h"
 #include "rocket/options.h"
 #include "rocket/record.h"
@@ -24,33 +21,6 @@
 namespace rocket {
 
 namespace internal {
-
-template <typename T>
-void Append(std::string& out, const T& value) {
-  if constexpr (std::is_convertible_v<const T&, std::string_view>) {
-    out.append(std::string_view(value));
-  } else if constexpr (std::is_same_v<T, char>) {
-    out.push_back(value);
-  } else if constexpr (std::is_same_v<T, bool>) {
-    out.append(value ? "true" : "false");
-  } else if constexpr (std::is_integral_v<T>) {
-    char buffer[24];
-    const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value);
-    out.append(buffer, result.ptr);
-#if defined(__cpp_lib_to_chars)
-  } else if constexpr (std::is_floating_point_v<T>) {
-    char buffer[32];
-    const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value);
-    out.append(buffer, result.ptr);
-#endif
-  } else if constexpr (std::is_enum_v<T>) {
-    Append(out, static_cast<std::underlying_type_t<T>>(value));
-  } else {
-    std::ostringstream stream;
-    stream << value;
-    out.append(stream.str());
-  }
-}
 
 inline std::string& ScratchText() {
   thread_local std::string text;
@@ -116,15 +86,13 @@ class Logger {
     record.location = location;
     if (writers_.empty()) {
       std::string text;
-      (internal::Append(text, args), ...);
-      record.message = text;
+      Compose(text, record, args...);
       WriteInline(record);
       return;
     }
     std::string& text = internal::ScratchText();
     text.clear();
-    (internal::Append(text, args), ...);
-    record.message = text;
+    Compose(text, record, args...);
     for (const auto& writer : writers_) writer->Enqueue(record);
   }
 
@@ -169,7 +137,23 @@ class Logger {
   }
 
  private:
-  void WriteInline(const Record& record) {
+  template <typename... Args>
+  void Compose(std::string& text, Record& record, const Args&... args) const {
+    if (options_.formatting == Formatting::kDeferred) {
+      (internal::Capture(text, args), ...);
+      record.args = text;
+    } else {
+      (internal::Append(text, args), ...);
+      record.message = text;
+    }
+  }
+
+  void WriteInline(Record& record) {
+    std::string rendered;
+    if (!record.args.empty() && internal::NeedText(sinks_)) {
+      internal::RenderArgs(record.args, rendered);
+      record.message = rendered;
+    }
     internal::DispatchAll(sinks_, record);
     internal::CommitAll(sinks_);
     if (record.level >= options_.flush_level) internal::FlushAll(sinks_);

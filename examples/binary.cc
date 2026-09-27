@@ -8,6 +8,7 @@ int main() {
   rocket::Options options;
   options.name = "orders";
   options.writers = rocket::Writers::kShared;
+  options.formatting = rocket::Formatting::kDeferred;
   rocket::Logger logger(
       options,
       {std::make_shared<rocket::BinaryFileSink>("logs/orders.blog", true),

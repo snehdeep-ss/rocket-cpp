@@ -22,6 +22,7 @@ struct Record {
   std::string_view logger_name;
   SourceLocation location;
   std::string_view message;
+  std::string_view args;
 };
 
 namespace internal {

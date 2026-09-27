@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "rocket/args.h"
 #include "rocket/level.h"
 #include "rocket/record.h"
 #include "rocket/sink.h"
@@ -21,27 +22,15 @@ namespace rocket {
 namespace internal {
 
 constexpr std::string_view kBinaryMagic = "ROCKETB";
-constexpr uint8_t kBinaryVersion = 1;
+constexpr uint8_t kBinaryVersion = 2;
 constexpr uint64_t kMaxBinaryField = uint64_t{1} << 30;
 
-enum class BinaryTag : uint8_t { kSession = 0, kString = 1, kRecord = 2 };
-
-inline void PutVarint(std::string& out, uint64_t value) {
-  while (value >= 0x80) {
-    out.push_back(static_cast<char>((value & 0x7f) | 0x80));
-    value >>= 7;
-  }
-  out.push_back(static_cast<char>(value));
-}
-
-inline uint64_t ZigZagEncode(int64_t value) {
-  return (static_cast<uint64_t>(value) << 1) ^
-         static_cast<uint64_t>(value >> 63);
-}
-
-inline int64_t ZigZagDecode(uint64_t value) {
-  return static_cast<int64_t>(value >> 1) ^ -static_cast<int64_t>(value & 1);
-}
+enum class BinaryTag : uint8_t {
+  kSession = 0,
+  kString = 1,
+  kRecord = 2,
+  kArgsRecord = 3
+};
 
 inline int64_t ToNanoseconds(std::chrono::system_clock::time_point time) {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -69,6 +58,7 @@ class BinaryFileSink : public Sink {
   }
 
   bool is_open() const { return file_.is_open(); }
+  bool NeedsText() const override { return false; }
 
  protected:
   void Process(const Record& record) override {
@@ -77,15 +67,19 @@ class BinaryFileSink : public Sink {
     const uint64_t logger = Intern(record.logger_name);
     const uint64_t file = Intern(record.location.file);
     const int64_t nanos = internal::ToNanoseconds(record.time);
-    buffer_.push_back(static_cast<char>(internal::BinaryTag::kRecord));
+    const bool deferred = !record.args.empty();
+    const std::string_view payload = deferred ? record.args : record.message;
+    buffer_.push_back(static_cast<char>(deferred
+                                            ? internal::BinaryTag::kArgsRecord
+                                            : internal::BinaryTag::kRecord));
     buffer_.push_back(static_cast<char>(record.level));
     internal::PutVarint(buffer_, internal::ZigZagEncode(nanos - last_nanos_));
     internal::PutVarint(buffer_, record.thread_id);
     internal::PutVarint(buffer_, logger);
     internal::PutVarint(buffer_, file);
     internal::PutVarint(buffer_, static_cast<uint32_t>(record.location.line));
-    internal::PutVarint(buffer_, record.message.size());
-    buffer_.append(record.message);
+    internal::PutVarint(buffer_, payload.size());
+    buffer_.append(payload);
     file_.Write(buffer_);
     last_nanos_ = nanos;
   }
@@ -143,7 +137,9 @@ class BinaryReader {
           if (!ReadString()) return false;
           break;
         case internal::BinaryTag::kRecord:
-          return ReadRecord(record);
+          return ReadRecord(record, false);
+        case internal::BinaryTag::kArgsRecord:
+          return ReadRecord(record, true);
         default:
           return Fail(Status::kCorrupt);
       }
@@ -202,7 +198,8 @@ class BinaryReader {
     }
     if (std::string_view(magic).substr(0, internal::kBinaryMagic.size()) !=
             internal::kBinaryMagic ||
-        static_cast<uint8_t>(magic.back()) != internal::kBinaryVersion) {
+        static_cast<uint8_t>(magic.back()) == 0 ||
+        static_cast<uint8_t>(magic.back()) > internal::kBinaryVersion) {
       return Fail(Status::kCorrupt);
     }
     strings_.clear();
@@ -223,7 +220,7 @@ class BinaryReader {
     return ReadBytes(value, length) || Fail(Status::kTruncated);
   }
 
-  bool ReadRecord(Record& record) {
+  bool ReadRecord(Record& record, bool deferred) {
     uint8_t level = 0;
     uint64_t delta = 0;
     uint64_t thread = 0;
@@ -241,7 +238,14 @@ class BinaryReader {
         length > internal::kMaxBinaryField) {
       return Fail(Status::kCorrupt);
     }
-    if (!ReadBytes(message_, length)) return Fail(Status::kTruncated);
+    std::string& payload = deferred ? args_ : message_;
+    if (!ReadBytes(payload, length)) return Fail(Status::kTruncated);
+    if (deferred) {
+      message_.clear();
+      if (!internal::RenderArgs(args_, message_)) {
+        return Fail(Status::kCorrupt);
+      }
+    }
     last_nanos_ += internal::ZigZagDecode(delta);
     record.level = static_cast<Level>(level);
     record.time = internal::FromNanoseconds(last_nanos_);
@@ -249,6 +253,7 @@ class BinaryReader {
     record.logger_name = strings_[logger];
     record.location = {strings_[file].c_str(), static_cast<int>(line)};
     record.message = message_;
+    record.args = deferred ? std::string_view(args_) : std::string_view();
     return true;
   }
 
@@ -260,6 +265,7 @@ class BinaryReader {
   bool in_session_ = false;
   std::deque<std::string> strings_;
   std::string message_;
+  std::string args_;
   int64_t last_nanos_ = 0;
 };
 

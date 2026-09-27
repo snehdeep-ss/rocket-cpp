@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "rocket/args.h"
 #include "rocket/options.h"
 #include "rocket/queue.h"
 #include "rocket/record.h"
@@ -35,9 +36,17 @@ inline void FlushAll(const SinkList& sinks) {
   for (const std::shared_ptr<Sink>& sink : sinks) sink->Flush();
 }
 
+inline bool NeedText(const SinkList& sinks) {
+  for (const std::shared_ptr<Sink>& sink : sinks) {
+    if (sink->NeedsText()) return true;
+  }
+  return false;
+}
+
 struct Entry {
   Record record;
   std::string text;
+  bool deferred = false;
 };
 
 class Writer {
@@ -47,6 +56,7 @@ class Writer {
         flush_level_(options.flush_level),
         flush_interval_(options.flush_interval),
         sinks_(std::move(sinks)),
+        needs_text_(NeedText(sinks_)),
         queue_(options.queue_capacity),
         thread_([this] { Run(); }) {}
 
@@ -66,9 +76,9 @@ class Writer {
 
   void Enqueue(const Record& record) {
     const auto fill = [&record](Entry& entry) {
-      entry.text.assign(record.message);
+      entry.deferred = !record.args.empty();
+      entry.text.assign(entry.deferred ? record.args : record.message);
       entry.record = record;
-      entry.record.message = entry.text;
     };
     for (int attempt = 0; !queue_.TryPush(fill); ++attempt) {
       switch (overflow_policy_) {
@@ -145,6 +155,20 @@ class Writer {
     flushed_.notify_all();
   }
 
+  void Resolve(Entry& entry) {
+    if (!entry.deferred) {
+      entry.record.message = entry.text;
+      entry.record.args = {};
+      return;
+    }
+    entry.record.args = entry.text;
+    entry.record.message = {};
+    if (!needs_text_) return;
+    rendered_.clear();
+    RenderArgs(entry.text, rendered_);
+    entry.record.message = rendered_;
+  }
+
   void Run() {
     Entry current;
     const auto take = [&current](Entry& entry) { std::swap(current, entry); };
@@ -155,7 +179,7 @@ class Writer {
       size_t drained = 0;
       bool urgent = false;
       while (drained < kBatchSize && queue_.TryPop(take)) {
-        current.record.message = current.text;
+        Resolve(current);
         DispatchAll(sinks_, current.record);
         urgent = urgent || current.record.level >= flush_level_;
         if (current.text.capacity() > kMaxRetainedText) {
@@ -201,6 +225,8 @@ class Writer {
   const Level flush_level_;
   const std::chrono::milliseconds flush_interval_;
   const SinkList sinks_;
+  const bool needs_text_;
+  std::string rendered_;
   BoundedQueue<Entry> queue_;
   std::atomic<uint64_t> dropped_{0};
 

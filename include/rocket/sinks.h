@@ -241,6 +241,9 @@ class CallbackSink : public TextSink {
 };
 
 class NullSink : public Sink {
+ public:
+  bool NeedsText() const override { return false; }
+
  protected:
   void Process(const Record&) override {}
 };

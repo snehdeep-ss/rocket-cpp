@@ -39,6 +39,7 @@ Arguments are concatenated. Strings, characters, booleans, integers, floats and 
 | `name`             | `"rocket"`      | Exposed to formatters as `{logger}`.                    |
 | `mode`             | `Mode::kAsync`  | `kAsync` uses writer threads, `kSync` writes inline.    |
 | `writers`          | `kShared`       | `kShared`: one writer for all sinks. `kPerSink`: one each. |
+| `formatting`       | `kEager`        | `kEager` formats on the caller, `kDeferred` on the writer. |
 | `overflow_policy`  | `kBlock`        | `kBlock`, `kDropNewest` or `kDropOldest` when full.     |
 | `queue_capacity`   | `8192`          | Pending records per writer, rounded to a power of 2.    |
 | `level`            | `Level::kInfo`  | Minimum level accepted. Changeable with `set_level`.    |
@@ -104,13 +105,36 @@ class SyslogSink : public rocket::TextSink {
 };
 ```
 
-To handle raw records without formatting, as `BinaryFileSink` does, derive from `Sink` and override `Process(const Record&)` instead.
+To handle raw records without formatting, as `BinaryFileSink` does, derive from `Sink` and override `Process(const Record&)` instead. Return `false` from `NeedsText()` if the sink never reads `Record::message`, so deferred records are not rendered for it.
 
 The writer calls `Commit` at the end of every batch and `Flush` on `flush_level`, `flush_interval` and `Logger::Flush`. All three are serialised by the base class, so one sink can be shared between loggers. `Record::message` and `line` are views that are valid only for the duration of the call.
 
+## Deferred formatting
+
+With `Formatting::kEager` the calling thread turns every argument into text before the record is queued. With `Formatting::kDeferred` it only captures them: numbers as raw values, strings as length and bytes, and anything else (types with `operator<<`, `long double`) formatted on the spot so every argument keeps working. Text is produced later, and only where it is needed:
+
+- text sinks: the writer thread renders it before dispatch;
+- `BinaryFileSink`: the captured arguments are stored as they are, and `rocket_decode` or `BinaryReader` renders them when the file is read;
+- raw sinks that return `false` from `NeedsText()`: nothing is rendered, and `Record::args` holds the captured arguments.
+
+Both modes share the same number formatting, so the text is identical either way.
+
+```cpp
+options.formatting = rocket::Formatting::kDeferred;
+```
+
+Measured per call on one thread, logging `"fill ", i, " px ", price, " qty ", qty, " venue ", 'X'`:
+
+| Sink              | `kEager` per call | `kDeferred` per call | `kEager` end to end | `kDeferred` end to end |
+| ----------------- | ----------------- | -------------------- | ------------------- | ---------------------- |
+| `BinaryFileSink`  | 222 ns            | 130 ns               | 255 ns              | 165 ns                 |
+| `FileSink` (text) | 225 ns            | 126 ns               | 263 ns              | 340 ns                 |
+
+Deferred formatting moves work off the calling thread; it does not remove it. Paired with `BinaryFileSink` it is faster everywhere. Paired with a text sink, calls get cheaper but the writer does more, so total throughput drops once the writer is saturated. Captured arguments are about the same size as their text, so deferred binary files are not smaller.
+
 ## Binary logs
 
-`BinaryFileSink` skips text formatting on the writer thread and stores each record as a level byte, a zig-zag varint nanosecond delta from the previous record, varint thread id and line, and the message bytes. Logger names and source files are written once per file and referenced by id afterwards.
+`BinaryFileSink` skips text formatting on the writer thread and stores each record, or its captured arguments under `Formatting::kDeferred`, as a level byte, a zig-zag varint nanosecond delta from the previous record, varint thread id and line, and the message bytes. Logger names and source files are written once per file and referenced by id afterwards.
 
 ```cpp
 rocket::Logger logger(options, {std::make_shared<rocket::BinaryFileSink>("logs/app.blog")});

@@ -11,10 +11,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -615,6 +617,167 @@ TEST(BinaryTest, RejectsCorruptInput) {
   }
   EXPECT_TRUE(ReadAll(path, BinaryReader::Status::kCorrupt).empty());
   EXPECT_FALSE(BinaryReader(path.parent_path() / "missing.blog").is_open());
+}
+
+struct Point {
+  int x;
+  int y;
+};
+
+std::ostream& operator<<(std::ostream& stream, const Point& point) {
+  return stream << '(' << point.x << ", " << point.y << ')';
+}
+
+enum class Color : uint8_t { kRed = 3 };
+enum Legacy { kLegacyValue = -7 };
+
+template <typename... Args>
+void ExpectDeferredMatchesEager(const Args&... args) {
+  std::string eager;
+  (internal::Append(eager, args), ...);
+  std::string captured;
+  (internal::Capture(captured, args), ...);
+  std::string rendered;
+  ASSERT_TRUE(internal::RenderArgs(captured, rendered));
+  EXPECT_EQ(rendered, eager);
+}
+
+TEST(DeferredTest, RendersEveryTypeLikeEagerFormatting) {
+  const std::string owned = "owned";
+  const char array[] = "array";
+  const char* pointer = "pointer";
+  ExpectDeferredMatchesEager("literal", owned, std::string_view("view"), array,
+                             pointer, std::string());
+  ExpectDeferredMatchesEager('c', true, false);
+  ExpectDeferredMatchesEager(0, -1, 42, std::numeric_limits<int>::min(),
+                             std::numeric_limits<int64_t>::min(),
+                             std::numeric_limits<int64_t>::max());
+  ExpectDeferredMatchesEager(
+      0u, std::numeric_limits<uint64_t>::max(), static_cast<unsigned char>(200),
+      static_cast<signed char>(-100), static_cast<short>(-3));
+  ExpectDeferredMatchesEager(0.1f, -2.5f, std::numeric_limits<float>::max(),
+                             0.1, -0.0, 1e300, 3.14159,
+                             std::numeric_limits<double>::infinity(),
+                             std::numeric_limits<double>::denorm_min());
+  ExpectDeferredMatchesEager(1.5L, Color::kRed, kLegacyValue, Point{1, -2});
+}
+
+TEST(DeferredTest, RejectsMalformedArgs) {
+  std::string rendered;
+  EXPECT_FALSE(internal::RenderArgs(std::string_view("\x09", 1), rendered));
+  EXPECT_FALSE(internal::RenderArgs(std::string_view("\x00\x05"
+                                                     "ab",
+                                                     4),
+                                    rendered));
+  EXPECT_FALSE(
+      internal::RenderArgs(std::string_view("\x06\x01\x02", 3), rendered));
+}
+
+std::vector<std::string> LogBoth(Options options) {
+  Collector collector;
+  {
+    Logger logger(options,
+                  {collector.MakeSink("{level} {file}:{line} {message}")});
+    for (int i = 0; i < 300; ++i) {
+      ROCKET_WARN(logger, "order ", i, " price ", 100.25 + i * 0.01, " side ",
+                  i % 2 == 0 ? 'B' : 'S', " ok=", true, ' ', Point{i, -i});
+    }
+    logger.Info();
+    logger.Error(std::string(6000, 'z'));
+  }
+  return collector.lines();
+}
+
+TEST(DeferredTest, TextOutputMatchesEagerInEveryMode) {
+  for (Mode mode : {Mode::kAsync, Mode::kSync}) {
+    Options eager = MakeOptions(mode);
+    Options deferred = eager;
+    deferred.formatting = Formatting::kDeferred;
+    const std::vector<std::string> expected = LogBoth(eager);
+    ASSERT_EQ(expected.size(), 302u);
+    EXPECT_EQ(LogBoth(deferred), expected);
+  }
+}
+
+class RawSink : public Sink {
+ public:
+  bool NeedsText() const override { return false; }
+
+  std::vector<std::pair<std::string, std::string>> seen;
+
+ protected:
+  void Process(const Record& record) override {
+    seen.emplace_back(record.message, record.args);
+  }
+};
+
+TEST(DeferredTest, RawSinksReceiveArgsWithoutRendering) {
+  auto raw = std::make_shared<RawSink>();
+  Options options = MakeOptions();
+  options.formatting = Formatting::kDeferred;
+  {
+    Logger logger(options, {raw});
+    logger.Info("value ", 7);
+  }
+  ASSERT_EQ(raw->seen.size(), 1u);
+  EXPECT_TRUE(raw->seen[0].first.empty());
+  std::string rendered;
+  ASSERT_TRUE(internal::RenderArgs(raw->seen[0].second, rendered));
+  EXPECT_EQ(rendered, "value 7");
+}
+
+TEST(DeferredTest, BinaryFilesStoreArgsAndDecodeToText) {
+  const std::filesystem::path directory = FreshDirectory("deferred_binary");
+  const std::string pattern =
+      "{time} [{level}] [{thread}] {file}:{line} {message}";
+  for (Formatting formatting : {Formatting::kEager, Formatting::kDeferred}) {
+    Options options = MakeOptions();
+    options.formatting = formatting;
+    const std::string name =
+        formatting == Formatting::kEager ? "eager" : "deferred";
+    Logger logger(options, {std::make_shared<FileSink>(
+                                directory / (name + ".log"), true,
+                                std::make_unique<PatternFormatter>(
+                                    pattern, PatternFormatter::Clock::kUtc)),
+                            std::make_shared<BinaryFileSink>(
+                                directory / (name + ".blog"), true)});
+    for (int i = 0; i < 2000; ++i) {
+      ROCKET_INFO(logger, "fill ", i, " px ", 101.25 + i * 0.0001, " qty ",
+                  i * 1000);
+    }
+  }
+
+  for (const char* name : {"eager", "deferred"}) {
+    std::string decoded;
+    const PatternFormatter formatter(pattern, PatternFormatter::Clock::kUtc);
+    BinaryReader reader(directory / (std::string(name) + ".blog"));
+    Record record;
+    while (reader.Next(record)) {
+      EXPECT_EQ(record.args.empty(), std::string_view(name) == "eager");
+      formatter.Format(record, decoded);
+      decoded.push_back('\n');
+    }
+    EXPECT_EQ(reader.status(), BinaryReader::Status::kOk);
+    EXPECT_EQ(decoded, ReadFile(directory / (std::string(name) + ".log")));
+  }
+}
+
+TEST(DeferredTest, ReadsVersionOneFiles) {
+  const std::filesystem::path path = FreshDirectory("version_one") / "a.blog";
+  {
+    Logger logger(MakeOptions(Mode::kSync),
+                  {std::make_shared<BinaryFileSink>(path, true)});
+    logger.Info("from v1");
+  }
+  {
+    std::fstream stream(path, std::ios::in | std::ios::out | std::ios::binary);
+    stream.seekp(
+        static_cast<std::streamoff>(internal::kBinaryMagic.size() + 1));
+    stream.put(1);
+  }
+  const std::vector<DecodedRecord> decoded = ReadAll(path);
+  ASSERT_EQ(decoded.size(), 1u);
+  EXPECT_EQ(decoded[0].message, "from v1");
 }
 
 }  // namespace

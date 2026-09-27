@@ -1,6 +1,7 @@
 #ifndef ROCKET_ROCKET_H_
 #define ROCKET_ROCKET_H_
 
+#include "rocket/args.h"
 #include "rocket/binary.h"
 #include "rocket/formatter.h"
 #include "rocket/level.h"

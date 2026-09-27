@@ -27,6 +27,8 @@ class Sink {
   }
   Level level() const { return level_.load(std::memory_order_relaxed); }
 
+  virtual bool NeedsText() const { return true; }
+
   void Consume(const Record& record) {
     if (record.level < level()) return;
     std::lock_guard<std::mutex> lock(mutex_);

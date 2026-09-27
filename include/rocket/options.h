@@ -15,10 +15,13 @@ enum class OverflowPolicy { kBlock, kDropNewest, kDropOldest };
 
 enum class Writers { kShared, kPerSink };
 
+enum class Formatting { kEager, kDeferred };
+
 struct Options {
   std::string name = "rocket";
   Mode mode = Mode::kAsync;
   Writers writers = Writers::kShared;
+  Formatting formatting = Formatting::kEager;
   OverflowPolicy overflow_policy = OverflowPolicy::kBlock;
   size_t queue_capacity = 8192;
   Level level = Level::kInfo;
