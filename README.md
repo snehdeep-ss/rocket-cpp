@@ -37,14 +37,29 @@ Arguments are concatenated. Strings, characters, booleans, integers, floats and 
 | `Options` field    | Default         | Meaning                                                 |
 | ------------------ | --------------- | ------------------------------------------------------- |
 | `name`             | `"rocket"`      | Exposed to formatters as `{logger}`.                    |
-| `mode`             | `Mode::kAsync`  | `kAsync` uses a worker thread, `kSync` writes inline.   |
+| `mode`             | `Mode::kAsync`  | `kAsync` uses writer threads, `kSync` writes inline.    |
+| `writers`          | `kShared`       | `kShared`: one writer for all sinks. `kPerSink`: one each. |
 | `overflow_policy`  | `kBlock`        | `kBlock`, `kDropNewest` or `kDropOldest` when full.     |
-| `queue_capacity`   | `8192`          | Pending records in async mode, rounded to a power of 2. |
+| `queue_capacity`   | `8192`          | Pending records per writer, rounded to a power of 2.    |
 | `level`            | `Level::kInfo`  | Minimum level accepted. Changeable with `set_level`.    |
 | `flush_level`      | `Level::kError` | Records at or above this level flush sinks immediately. |
 | `flush_interval`   | `1000ms`        | Idle interval after which buffered output is flushed.   |
 
-`logger.Flush()` blocks until every record logged before the call is written and flushed. The destructor drains the queue. `logger.dropped()` reports records discarded by a drop policy.
+`logger.Flush()` blocks until every record logged before the call is written and flushed by every writer. The destructor drains the queues. `logger.dropped()` reports records discarded by a drop policy, summed across writers, and `logger.writer_threads()` reports how many writers are running.
+
+## Writer threads
+
+With `Writers::kShared` a single background thread formats and writes every record to every sink. With `Writers::kPerSink` each sink gets its own thread and its own lock-free queue: the message is composed once on the calling thread and copied into each queue. Sinks then format and write in parallel, and a slow sink (a network socket, a full disk) cannot stall the others. The overflow policy applies to each queue independently.
+
+Measured on 8 cores with 2M messages from 8 threads, in ns per message:
+
+| File sinks | `kShared` | `kPerSink` |
+| ---------- | --------- | ---------- |
+| 1          | 204       | 205        |
+| 2          | 331       | 240        |
+| 3          | 449       | 321        |
+
+Use `kShared` for a single sink or to keep thread count down, and `kPerSink` when several sinks are busy or one of them is slow.
 
 `rocket::ParseLevel("warn")` turns environment variables or config values into a `Level`.
 
@@ -86,7 +101,7 @@ class SyslogSink : public rocket::Sink {
 };
 ```
 
-The logger calls `Commit` at the end of every batch and `Flush` on `flush_level`, `flush_interval` and `Logger::Flush`. All three are serialised by the base class, so one sink can be shared between loggers. `Record::message` and `line` are views that are valid only for the duration of the call.
+The writer calls `Commit` at the end of every batch and `Flush` on `flush_level`, `flush_interval` and `Logger::Flush`. All three are serialised by the base class, so one sink can be shared between loggers. `Record::message` and `line` are views that are valid only for the duration of the call.
 
 ## Formatting
 

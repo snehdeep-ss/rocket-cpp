@@ -25,6 +25,7 @@ int main() {
   options.name = "basic";
   options.level = rocket::Level::kDebug;
   options.overflow_policy = rocket::OverflowPolicy::kDropOldest;
+  options.writers = rocket::Writers::kPerSink;
   rocket::Logger logger(options, {console, file, alerts});
 
   ROCKET_INFO(logger, "rocket-cpp ", "started");

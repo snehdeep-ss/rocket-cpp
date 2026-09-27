@@ -4,9 +4,11 @@
 #include "rocket/formatter.h"
 #include "rocket/level.h"
 #include "rocket/logger.h"
+#include "rocket/options.h"
 #include "rocket/queue.h"
 #include "rocket/record.h"
 #include "rocket/sink.h"
 #include "rocket/sinks.h"
+#include "rocket/writer.h"
 
 #endif  // ROCKET_ROCKET_H_

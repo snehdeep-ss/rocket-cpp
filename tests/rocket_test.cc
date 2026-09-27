@@ -342,6 +342,71 @@ TEST(LoggerTest, RecycledSlotsKeepMessagesIntact) {
   EXPECT_EQ(collector.lines(), expected);
 }
 
+TEST(WritersTest, SharedModeUsesOneThread) {
+  Collector first;
+  Collector second;
+  Logger logger(MakeOptions(), {first.MakeSink(), second.MakeSink()});
+
+  EXPECT_EQ(logger.writer_threads(), 1u);
+}
+
+TEST(WritersTest, PerSinkModeDeliversToEverySink) {
+  constexpr int kThreads = 4;
+  constexpr int kPerThread = 5000;
+  Collector first;
+  Collector second;
+  Options options = MakeOptions();
+  options.writers = Writers::kPerSink;
+  options.queue_capacity = 64;
+  Logger logger(options, {first.MakeSink("{thread} {message}"),
+                          second.MakeSink("{thread} {message}")});
+  EXPECT_EQ(logger.writer_threads(), 2u);
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&logger] {
+      for (int i = 0; i < kPerThread; ++i) logger.Info(i);
+    });
+  }
+  for (std::thread& thread : threads) thread.join();
+  logger.Flush();
+
+  for (const Collector* collector : {&first, &second}) {
+    std::map<std::string, int> next;
+    for (const std::string& line : collector->lines()) {
+      const size_t space = line.find(' ');
+      int& expected = next[line.substr(0, space)];
+      EXPECT_EQ(line.substr(space + 1), std::to_string(expected));
+      ++expected;
+    }
+    EXPECT_EQ(next.size(), static_cast<size_t>(kThreads));
+    for (const auto& [thread, count] : next) EXPECT_EQ(count, kPerThread);
+  }
+  EXPECT_EQ(logger.dropped(), 0u);
+}
+
+TEST(WritersTest, PerSinkModeIsolatesSlowSinks) {
+  std::promise<void> release;
+  std::shared_future<void> released = release.get_future().share();
+  auto slow = std::make_shared<CallbackSink>(
+      [released](const Record&, std::string_view) { released.wait(); });
+  Collector fast;
+  Options options = MakeOptions();
+  options.writers = Writers::kPerSink;
+  Logger logger(options, {slow, fast.MakeSink()});
+
+  for (int i = 0; i < 100; ++i) logger.Info(i);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (fast.lines().size() < 100 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  EXPECT_EQ(fast.lines().size(), 100u);
+  release.set_value();
+}
+
 TEST(LoggerTest, DestructorDrainsQueue) {
   Collector collector;
   {
